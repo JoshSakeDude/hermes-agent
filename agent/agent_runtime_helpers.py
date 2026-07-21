@@ -2623,6 +2623,37 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     if normalized in agent.valid_tool_names:
         return normalized
 
+    # Cross-vocabulary alias table: catches tool names leaked from a
+    # different agent framework's schema (e.g. Claude Code tool names
+    # bleeding through a misconfigured Dario proxy running --merge-tools).
+    # These are NOT spelling variants of a Hermes tool name — they're a
+    # different name entirely for an equivalent capability — so the
+    # difflib fuzzy match below (which compares string similarity) will
+    # never catch them. See hermes-agent skill's "Dario/CC Tool Confusion"
+    # pitfall. Checked before fuzzy match; only returned if the mapped
+    # target is actually a valid tool in this session (defensive against
+    # toolset changes).
+    CC_TOOL_ALIASES = {
+        "bash": "terminal",
+        "shell": "terminal",
+        "read": "read_file",
+        "write": "write_file",
+        "edit": "patch",
+        "multiedit": "patch",
+        "skill": "skill_view",
+        "agent": "delegate_task",
+        "task": "delegate_task",
+        "todowrite": "todo",
+        "todoread": "todo",
+        "glob": "search_files",
+        "grep": "search_files",
+        "webfetch": "web_extract",
+        "websearch": "web_search",
+    }
+    alias = CC_TOOL_ALIASES.get(normalized)
+    if alias and alias in agent.valid_tool_names:
+        return alias
+
     # Build the full candidate set for class-like emissions.
     cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
     # Strip trailing tool-suffix up to twice — TodoTool_tool needs it.

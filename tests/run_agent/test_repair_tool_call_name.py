@@ -25,6 +25,10 @@ VALID = {
     "read_file",
     "write_file",
     "terminal",
+    "search_files",
+    "web_extract",
+    "skill_view",
+    "delegate_task",
     "execute_code",
     "session_search",
 }
@@ -65,6 +69,53 @@ class TestExistingBehaviorStillWorks:
 
     def test_unknown_returns_none(self, repair):
         assert repair("xyz_no_such_tool") is None
+
+
+class TestCrossVocabularyAliases:
+    """Claude Code names can leak from an upstream proxy into Hermes calls.
+
+    These are semantic aliases rather than casing or spelling variants, so
+    fuzzy matching cannot recover them.  Keep this explicit crosswalk covered.
+    """
+
+    @pytest.mark.parametrize(
+        ("emitted", "expected"),
+        [
+            ("Bash", "terminal"),
+            ("Shell", "terminal"),
+            ("Read", "read_file"),
+            ("Write", "write_file"),
+            ("Edit", "patch"),
+            ("MultiEdit", "patch"),
+            ("TodoWrite", "todo"),
+            ("TodoRead", "todo"),
+            ("Glob", "search_files"),
+            ("Grep", "search_files"),
+            ("WebFetch", "web_extract"),
+            ("WebSearch", "web_search"),
+            ("Skill", "skill_view"),
+            ("Agent", "delegate_task"),
+            ("Task", "delegate_task"),
+        ],
+    )
+    def test_claude_code_aliases(self, repair, emitted, expected):
+        assert repair(emitted) == expected
+
+    @pytest.mark.parametrize(
+        ("emitted", "enabled_tools"),
+        [
+            ("Bash", {"read_file"}),
+            ("Skill", {"terminal"}),
+            ("Agent", {"skill_view"}),
+        ],
+    )
+    def test_alias_respects_enabled_toolset(self, emitted, enabled_tools):
+        # Never translate an emitted name into a tool that is unavailable in
+        # this session; that would turn a clear error into a misleading one.
+        limited = SimpleNamespace(valid_tool_names=enabled_tools)
+        from run_agent import AIAgent
+        limited_repair = AIAgent._repair_tool_call.__get__(limited, AIAgent)
+        assert limited_repair(emitted) is None
 
 
 class TestClassLikeEmissions:
