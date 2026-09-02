@@ -179,9 +179,26 @@ def is_titleable_user_message(user_message: str) -> bool:
             and bool(_summarize_user_message(user_message).strip()))
 
 
+# Markdown code-fence delimiter: ``` or ~~~, optionally followed by an info
+# string (```json, ~~~python). A line that is only a fence carries no intent
+# worth titling — see derive_title.
+_FENCE_LINE_RE = re.compile(r"^\s*(?:`{3,}|~{3,})\s*[\w+.-]*\s*$")
+
+
+def _is_fence_line(line: str) -> bool:
+    """Return whether *line* is nothing but a markdown code-fence delimiter."""
+    return bool(_FENCE_LINE_RE.match(line or ""))
+
+
 def derive_title(user_message: str) -> Optional[str]:
-    """Instant title: first meaningful line trimmed to a word boundary. No model, never fails."""
-    line = " ".join(_first_line(_summarize_user_message(user_message)).split())
+    """Instant title: first meaningful non-fence line. No model, never fails."""
+    text = _summarize_user_message(user_message)
+    line = " ".join(
+        next(
+            (ln.strip() for ln in text.splitlines() if ln.strip() and not _is_fence_line(ln)),
+            "",
+        ).split()
+    )
     if len(line) > MAX_DERIVED_TITLE_CHARS:
         cut = line[:MAX_DERIVED_TITLE_CHARS]
         space = cut.rfind(" ")
