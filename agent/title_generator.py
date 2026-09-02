@@ -316,6 +316,11 @@ def _extract_title_text(content: str) -> str:
     fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
     if fenced:
         raw = fenced.group(1).strip()
+    elif re.match(r"^```(?:json)?(?:\s|$)", raw, re.IGNORECASE):
+        # A reasoning-capable model can exhaust its output budget after only
+        # opening a JSON fence. That fragment carries no title and must not be
+        # promoted to LLM authority (where later turns can no longer repair it).
+        return ""
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and isinstance(parsed.get("title"), str):
@@ -423,9 +428,12 @@ def generate_title(
         response = call_llm(
             task="title_generation",
             messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
+            # A title is a handful of visible tokens, but reasoning-capable
+            # models such as Gemini 2.5 Flash spend from the same completion
+            # ceiling before emitting JSON. At 64-256 tokens that model
+            # repeatedly stopped after only `````json``; 512 is the smallest
+            # ceiling verified to complete the constrained response.
+            max_tokens=512,
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,

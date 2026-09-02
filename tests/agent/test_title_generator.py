@@ -45,6 +45,27 @@ class TestGenerateTitle:
 
         assert captured_kwargs["task"] == "title_generation"
         assert captured_kwargs["timeout"] is None
+        # Gemini 2.5 Flash spends part of this ceiling on hidden reasoning.
+        # A 64-token budget repeatedly stopped after only `````json`` and
+        # polluted the session list with that fragment.
+        assert captured_kwargs["max_tokens"] >= 512
+
+    @pytest.mark.parametrize(
+        "content",
+        (
+            "```json",
+            "```json\n{\n  ",
+            "```json\n{\"title",
+        ),
+    )
+    def test_rejects_truncated_json_fences(self, content):
+        """A length-truncated structured response is not a session title."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = content
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("fix the marketing dashboard") is None
 
 
 
