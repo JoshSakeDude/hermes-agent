@@ -222,6 +222,11 @@ def _extract_title_text(content: str) -> str:
     fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
     if fenced:
         raw = fenced.group(1).strip()
+    elif re.match(r"^```(?:json)?(?:\s|$)", raw, re.IGNORECASE):
+        # A reasoning-capable model can exhaust its output budget after only
+        # opening a JSON fence. That fragment carries no title and must not be
+        # promoted to LLM authority (where later turns can no longer repair it).
+        return ""
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict) and isinstance(parsed.get("title"), str):
@@ -314,8 +319,8 @@ def generate_title(
         response = call_llm(
             task="title_generation",
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_snippet}],
-            # A title is a handful of tokens; a larger ceiling let chatty models burn seconds.
-            max_tokens=64, temperature=0.3, timeout=timeout, main_runtime=main_runtime,
+            # Reasoning-capable models spend from the completion ceiling before JSON.
+            max_tokens=512, temperature=0.3, timeout=timeout, main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
             # The module contract above promises thinking-disabled operation,
             # but nothing enforced it: with the aux default reasoning_effort
