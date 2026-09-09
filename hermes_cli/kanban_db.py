@@ -1156,6 +1156,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Token-budget auto-continuation counter. Incremented each time
+    # a worker yields because it hit its token ceiling (outcome
+    # 'budget_yielded'). The dispatcher allows up to
+    # MAX_BUDGET_CONTINUATIONS (2) automatic re-dispatches; after
+    # that the task is auto-blocked needs_input. Reset to 0 on
+    # successful completion. See ``agent/kanban_budget.py``.
+    budget_continuation_count: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1263,6 +1270,12 @@ class Task:
             block_recurrences=(
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
+                else 0
+            ),
+            budget_continuation_count=(
+                int(row["budget_continuation_count"])
+                if "budget_continuation_count" in keys
+                and row["budget_continuation_count"] is not None
                 else 0
             ),
         )
@@ -1437,6 +1450,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Per-task estimated-cost ceiling in USD. Stored as TEXT so Decimal
     -- precision survives the TEXT→Decimal round-trip without truncation.
     max_estimated_cost_usd TEXT,
+    -- Auto-continuation counter for token-budget yield. Every time a
+    -- worker hits its token ceiling and the run ends with outcome
+    -- 'budget_yielded', this counter is incremented. The dispatcher
+    -- re-queues the task in 'ready' (behind other eligible work) for
+    -- automatic continuation. After MAX_BUDGET_CONTINUATIONS (2) cycles
+    -- the task is auto-blocked with kind='needs_input' rather than
+    -- continuing — the work is genuinely too large for its ceiling.
+    -- Reset to 0 only on successful completion.
+    budget_continuation_count INTEGER NOT NULL DEFAULT 0,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -2727,6 +2749,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # precision. NULL = no ceiling.
         _add_column_if_missing(
             conn, "tasks", "max_estimated_cost_usd", "max_estimated_cost_usd TEXT"
+        )
+
+    if "budget_continuation_count" not in cols:
+        # Auto-continuation counter for token-budget yield. Default 0
+        # preserves behaviour for existing rows and legacy DBs.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "budget_continuation_count",
+            "budget_continuation_count INTEGER NOT NULL DEFAULT 0",
         )
 
     if "session_id" not in cols:
@@ -10889,6 +10921,18 @@ def _default_spawn(
     # (see agent/turn_finalizer._record_kanban_budget_exhausted).
     if task.max_iterations is not None:
         env["HERMES_MAX_ITERATIONS"] = str(int(task.max_iterations))
+    # Per-task token ceiling. When set, export it so the worker's agent
+    # loop can track billable-token consumption against the ceiling.
+    # See agent/kanban_budget.TokenBudget and agent/turn_finalizer.
+    if task.max_total_tokens is not None:
+        env["HERMES_KANBAN_MAX_TOTAL_TOKENS"] = str(int(task.max_total_tokens))
+    # Token-budget continuation counter. When > 0, the worker is a
+    # continuation of a prior budget_yielded run and should treat its
+    # budget as cumulative (carry-forward). See TokenBudget docs.
+    if task.budget_continuation_count > 0:
+        env["HERMES_KANBAN_BUDGET_CONTINUATION_COUNT"] = (
+            str(task.budget_continuation_count)
+        )
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),

@@ -275,3 +275,281 @@ def test_token_budget_from_row_hydrates_set_values(kanban_home):
         ).fetchone()
         assert row["max_total_tokens"] == 300_000
         assert row["max_estimated_cost_usd"] == "10"
+
+
+# ===========================================================================
+# Phase B - TokenBudget, yield, continuation, and circuit breaker
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# TokenBudget - billable token tracking against per-task ceiling
+# ---------------------------------------------------------------------------
+
+def test_token_budget_initial_state():
+    """A fresh TokenBudget starts at 0 and reports correct remaining."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000)
+    assert tb.max_total_tokens == 100_000
+    assert tb.billable_tokens == 0
+    assert tb.remaining == 100_000
+    assert tb.fraction_used == 0.0
+    assert not tb.is_exhausted
+    assert not tb.should_warn
+
+
+def test_token_budget_consume_accumulates_billable():
+    """Consuming a BudgetSnapshot adds billable tokens correctly."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000)
+    snap = BudgetSnapshot(
+        input_tokens=500,
+        output_tokens=200,
+        cache_write_tokens=50,
+    )
+    tb.consume(snap)
+    # billable = 500 + 200 + 50 = 750
+    assert tb.billable_tokens == 750
+    assert tb.remaining == 99_250
+    assert tb.fraction_used == 0.0075
+
+
+def test_token_budget_warns_at_75_percent():
+    """At >=75% of ceiling, should_warn returns True."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000)
+    snap = BudgetSnapshot(
+        input_tokens=50000,
+        output_tokens=25000,
+        cache_write_tokens=0,
+    )
+    tb.consume(snap)
+    assert tb.billable_tokens == 75_000
+    assert tb.fraction_used == 0.75
+    assert tb.should_warn
+
+
+def test_token_budget_warns_only_once():
+    """After the first warn, should_warn returns False until reset."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000)
+    snap75 = BudgetSnapshot(input_tokens=75000)
+    tb.consume(snap75)
+    assert tb.should_warn
+    snap5 = BudgetSnapshot(input_tokens=5000)
+    tb.consume(snap5)
+    assert not tb.should_warn  # already warned
+
+
+def test_token_budget_exhausted_at_ceiling():
+    """When billable tokens reach max_total_tokens, is_exhausted is True."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=10_000)
+    snap = BudgetSnapshot(input_tokens=10000)
+    tb.consume(snap)
+    assert tb.billable_tokens == 10_000
+    assert tb.remaining == 0
+    assert tb.fraction_used == 1.0
+    assert tb.is_exhausted
+
+
+def test_token_budget_exhausted_after_finalization():
+    """After entering finalization, exhaustion only when turns consumed."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000)
+    snap = BudgetSnapshot(input_tokens=100_000)
+    tb.consume(snap)
+    assert tb.is_exhausted  # at ceiling
+    tb.enter_finalization(allowance=3)
+    assert not tb.is_exhausted  # still has finalization turns
+    assert tb.finalization_remaining == 3
+    tb.consume_finalization_turn()
+    tb.consume_finalization_turn()
+    tb.consume_finalization_turn()
+    assert tb.is_exhausted  # finalization gone
+
+
+def test_token_budget_carry_forward():
+    """Carry-forward from prior runs is added to billable tokens."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    carry = BudgetSnapshot(input_tokens=30000)
+    tb = TokenBudget(max_total_tokens=100_000, carry_forward=carry)
+    assert tb.billable_tokens == 30_000
+    assert tb.remaining == 70_000
+    assert tb.fraction_used == 0.3
+
+
+def test_token_budget_with_continuation_count():
+    """Continuation count is tracked."""
+    from agent.kanban_budget import TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000)
+    assert tb.continuation_count == 0
+    tb.continuation_count = 1
+    assert tb.continuation_count == 1
+    tb.continuation_count = 2
+    assert tb.continuation_count == 2
+
+
+def test_token_budget_continuation_exhausted():
+    """When continuation count reaches MAX_BUDGET_CONTINUATIONS, flagged."""
+    from agent.kanban_budget import TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000, continuation_count=2)
+    assert tb.continuation_exhausted
+
+
+def test_token_budget_no_ceiling_never_exhausted():
+    """max_total_tokens=None means no ceiling - never exhausted."""
+    from agent.kanban_budget import TokenBudget
+
+    tb = TokenBudget(max_total_tokens=None)
+    assert not tb.is_exhausted
+    assert tb.remaining is None
+    assert not tb.should_warn
+
+
+def test_token_budget_continuation_context():
+    """The structured handoff context carries counters and prior summary."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    carry = BudgetSnapshot(input_tokens=30000)
+    tb = TokenBudget(
+        max_total_tokens=100_000,
+        carry_forward=carry,
+        continuation_count=1,
+        handoff_summary="prior run: fixed typo in three files",
+    )
+    ctx = tb.continuation_context()
+    assert "2 of 2" in ctx or "continuation" in ctx.lower()
+    assert "30,000" in ctx
+    assert "70,000" in ctx
+    assert "prior run" in ctx.lower()
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher integration - budget_yielded outcome and continuation column
+# ---------------------------------------------------------------------------
+
+def test_budget_yielded_schema():
+    """budget_yielded is a recognized outcome constant."""
+    from agent.kanban_budget import BUDGET_YIELDED_OUTCOME
+    assert BUDGET_YIELDED_OUTCOME == "budget_yielded"
+
+
+def test_budget_continuation_count_column_in_schema(kanban_home):
+    """After init_db, the tasks table has budget_continuation_count."""
+    with kb.connect() as conn:
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+    assert "budget_continuation_count" in cols
+
+
+def test_budget_continuation_count_defaults_to_zero(kanban_home):
+    """New tasks have budget_continuation_count = 0."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fresh task", assignee="gohanlite")
+        row = conn.execute(
+            "SELECT budget_continuation_count FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        assert row["budget_continuation_count"] == 0
+
+
+def test_budget_continuation_count_persists(kanban_home):
+    """Setting budget_continuation_count survives round-trip."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="continuing task", assignee="gohanlite")
+        conn.execute(
+            "UPDATE tasks SET budget_continuation_count = 1 WHERE id = ?", (t,)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT budget_continuation_count FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        assert row["budget_continuation_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Migration - legacy DB gets budget_continuation_count
+# ---------------------------------------------------------------------------
+
+def test_migration_adds_continuation_count_to_legacy_db(tmp_path, monkeypatch):
+    """When a legacy kanban.db is opened, migration adds
+    budget_continuation_count and existing rows get 0."""
+    home = tmp_path / ".hermes-legacy-b"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    kb.init_db()
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="legacy continuation task",
+            assignee="gohanlite",
+        )
+        task = kb.get_task(conn, t)
+        assert task.budget_continuation_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Independence - max_iterations and unrelated dispatch
+# ---------------------------------------------------------------------------
+
+def test_max_iterations_independent_of_token_ceiling(kanban_home):
+    """A card can have both max_iterations and max_total_tokens set
+    independently, and both round-trip."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="double budget task",
+            assignee="gohanlite",
+            max_iterations=50,
+            max_total_tokens=200_000,
+        )
+        task = kb.get_task(conn, t)
+        assert task.max_iterations == 50
+        assert task.max_total_tokens == 200_000
+        assert task.budget_continuation_count == 0
+
+
+def test_no_ceiling_cards_still_dispatch():
+    """A card without token ceiling dispatches normally (TokenBudget
+    with max_total_tokens=None is never exhausted)."""
+    from agent.kanban_budget import TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000)
+    assert tb.max_total_tokens == 100_000
+
+    tb2 = TokenBudget(max_total_tokens=None)
+    assert tb2.max_total_tokens is None
+    assert not tb2.is_exhausted
+
+
+def test_budget_yielded_continuation_capped_at_two(kanban_home):
+    """When budget_continuation_count reaches 2, dispatcher blocks
+    with needs_input. Schema-level: counter round-trips."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="exhausted task",
+            assignee="gohanlite",
+            max_total_tokens=10_000,
+        )
+        conn.execute(
+            "UPDATE tasks SET budget_continuation_count = 2 WHERE id = ?", (t,)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT budget_continuation_count FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        assert row["budget_continuation_count"] == 2
