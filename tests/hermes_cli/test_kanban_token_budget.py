@@ -553,3 +553,166 @@ def test_budget_yielded_continuation_capped_at_two(kanban_home):
             "SELECT budget_continuation_count FROM tasks WHERE id = ?", (t,)
         ).fetchone()
         assert row["budget_continuation_count"] == 2
+
+
+# ============================================================================
+# Phase B — budget_yielded dispatcher integration tests
+# ============================================================================
+
+
+def test_budget_yielded_releases_to_ready_and_increments_counter(kanban_home):
+    """A claimed running task that yields on first continuation: run closes
+    with budget_yielded, claim is released, card returns to ready, and
+    budget_continuation_count goes from 0 to 1."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="yield task", assignee="gohanlite",
+            max_total_tokens=100_000,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+
+    # Simulate a worker yielding from budget exhaustion.
+    kb._finalize_budget_yielded(
+        kb.connect(), t,
+        handoff_summary="did part A, piack up at part B",
+        billable_tokens=75_000,
+        max_total_tokens=100_000,
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "ready", f"expected ready, got {task.status}"
+        assert task.claim_lock is None, "claim should be released"
+        assert task.budget_continuation_count == 1
+
+        # Run outcome should be budget_yielded.
+        events = kb.list_events(conn, t)
+        yield_events = [e for e in events if e.kind == "budget_yielded"]
+        assert len(yield_events) == 1
+        payload = yield_events[0].payload or {}
+        assert payload.get("continuation_count") == 1
+        assert payload["billed"] == 75_000
+
+
+def test_budget_yielded_blocks_on_third_exhaustion(kanban_home):
+    """After two budget continuations (counter at 2), the third yield blocks
+    with needs_input rather than returning to ready."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="blocked yield", assignee="gohanlite",
+            max_total_tokens=50_000,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+
+        for _ in range(2):
+            kb.claim_task(conn, t, claimer=f"{host}:worker")
+            # Reset connection for next claim, return to active
+            conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, current_run_id = NULL "
+                "WHERE id = ?", (t,)
+            )
+            conn.execute(
+                "UPDATE tasks SET budget_continuation_count = budget_continuation_count + 1 "
+                "WHERE id = ?", (t,)
+            )
+        conn.commit()
+
+    # After 2 continuations, this yield should block.
+    with kb.connect() as conn:
+        kb.claim_task(conn, t, claimer=f"{host}:worker_2")
+    status = kb._finalize_budget_yielded(
+        kb.connect(), t,
+        handoff_summary="final exhaustion",
+        billable_tokens=50_000,
+        max_total_tokens=50_000,
+    )
+
+    assert status == "blocked", f"expected blocked, got {status}"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "blocked"
+        events = kb.list_events(conn, t)
+        blocked = [e for e in events if e.kind == "budget_yielded_blocked"]
+        assert len(blocked) == 1, "expected a budget_yielded_blocked event"
+
+
+def test_budget_yielded_does_not_increment_failure_counter(kanban_home):
+    """A budget yield is NOT a failure — consecutive_failures stays at 0."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="no-fail yield", assignee="gohanlite",
+            max_total_tokens=100_000,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+
+    kb._finalize_budget_yielded(
+        kb.connect(), t,
+        handoff_summary="clean handoff",
+        billable_tokens=80_000,
+        max_total_tokens=100_000,
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.consecutive_failures == 0, (
+            f"budget yield should not increment failures, got {task.consecutive_failures}"
+        )
+
+
+def test_budget_yielded_unset_ceiling_never_blocks(kanban_home):
+    """A task with max_total_tokens=None: TokenBudget is unbounded, no yield."""
+    from agent.kanban_budget import TokenBudget
+
+    tb = TokenBudget(max_total_tokens=None)
+    assert not tb.is_exhausted
+    assert tb.remaining is None
+    assert not tb.continuation_exhausted
+
+
+# ============================================================================
+# Phase B — agent-loop integration (TokenBudget from env vars)
+# ============================================================================
+
+
+def test_token_budget_created_from_env_vars():
+    """When HERMES_KANBAN_MAX_TOTAL_TOKENS is set, TokenBudget is created
+    with the ceiling and any continuation count from env."""
+    import os
+    from agent.kanban_budget import TokenBudget
+
+    os.environ["HERMES_KANBAN_MAX_TOTAL_TOKENS"] = "200000"
+    os.environ["HERMES_KANBAN_BUDGET_CONTINUATION_COUNT"] = "1"
+    try:
+        tb = TokenBudget(
+            max_total_tokens=int(os.environ["HERMES_KANBAN_MAX_TOTAL_TOKENS"]),
+            continuation_count=int(os.environ["HERMES_KANBAN_BUDGET_CONTINUATION_COUNT"]),
+        )
+        assert tb.max_total_tokens == 200_000
+        assert tb.continuation_count == 1
+    finally:
+        os.environ.pop("HERMES_KANBAN_MAX_TOTAL_TOKENS", None)
+        os.environ.pop("HERMES_KANBAN_BUDGET_CONTINUATION_COUNT", None)
+
+
+def test_token_budget_yield_signal_at_hard_ceiling():
+    """After reaching the ceiling and consuming all finalization turns,
+    is_exhausted returns True and the budget should yield."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=10_000)
+    snap = BudgetSnapshot(input_tokens=10_000)
+    tb.consume(snap)
+    # At ceiling, no finalization -> exhausted
+    assert tb.is_exhausted is True
+    assert tb.finalization_remaining == 0
+
+    # Enter finalization -> not exhausted until turns consumed
+    tb.enter_finalization(allowance=2)
+    assert tb.is_exhausted is False
+    tb.consume_finalization_turn()
+    tb.consume_finalization_turn()
+    assert tb.finalization_remaining == 0
+    assert tb.is_exhausted is True

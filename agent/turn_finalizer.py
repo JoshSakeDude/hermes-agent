@@ -123,6 +123,49 @@ def _record_kanban_budget_exhausted(
         )
 
 
+
+def _record_kanban_token_budget_yielded(
+    kanban_task: str,
+    handoff_summary: str,
+    billable_tokens: int,
+    max_total_tokens: int,
+    logger,
+) -> None:
+    """Record a cooperative ``budget_yielded`` outcome for a kanban worker
+    that exhausted its token ceiling.
+
+    Unlike iteration-budget exhaustion (which force-trips the failure
+    circuit breaker), a budget yield is a cooperative handoff: the worker
+    releases its claim voluntarily and the card returns to ``ready`` for
+    the next continuation. The circuit breaker is the
+    ``budget_continuation_count``, not ``consecutive_failures``.
+
+    When the continuation count reaches ``MAX_BUDGET_CONTINUATIONS`` (2),
+    ``_finalize_budget_yielded`` blocks the card with ``needs_input``.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        _conn = _kb.connect()
+        try:
+            _kb._finalize_budget_yielded(
+                _conn,
+                kanban_task,
+                handoff_summary=handoff_summary,
+                billable_tokens=billable_tokens,
+                max_total_tokens=max_total_tokens,
+            )
+        finally:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.warning(
+            "Failed to record budget-yielded outcome for task %s",
+            kanban_task,
+            exc_info=True,
+        )
+
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 

@@ -9457,6 +9457,83 @@ def _record_spawn_failure(
     )
 
 
+
+def _finalize_budget_yielded(
+    conn,
+    task_id,
+    *,
+    handoff_summary='',
+    billable_tokens=0,
+    max_total_tokens=0,
+):
+    """Handle a token-budget yield: end the current run with outcome
+    ``budget_yielded``, release the claim, increment the continuation
+    counter, and return the card to ``ready`` behind other eligible work.
+    
+    Does NOT increment ``consecutive_failures`` -- a budget yield is a
+    cooperative handoff, not a crash/timeout. The circuit breaker is the
+    ``budget_continuation_count``, not the unified failure counter.
+    
+    If ``budget_continuation_count`` reaches ``MAX_BUDGET_CONTINUATIONS``
+    (2), the task is blocked ``needs_input`` instead of returning to
+    ``ready``. The human must split/reallocate before the task continues.
+    
+    Returns the new status ("ready" or "blocked").
+    """
+    from agent.kanban_budget import MAX_BUDGET_CONTINUATIONS
+    now = int(time.time())
+    with write_txn(conn):
+        _end_run(
+            conn, task_id, outcome='budget_yielded',
+            summary=handoff_summary[:500] if handoff_summary else None,
+            metadata={
+                'billable_tokens': billable_tokens,
+                'max_total_tokens': max_total_tokens,
+            },
+        )
+        conn.execute(
+            """UPDATE tasks
+               SET claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, current_run_id = NULL
+             WHERE id = ?""",
+            (task_id,),
+        )
+        conn.execute(
+            """UPDATE tasks
+               SET budget_continuation_count = budget_continuation_count + 1
+             WHERE id = ?""",
+            (task_id,),
+        )
+        row = conn.execute(
+            "SELECT budget_continuation_count FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        count = int(row["budget_continuation_count"]) if row else 0
+        
+        if count >= MAX_BUDGET_CONTINUATIONS:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ?",
+                (task_id,),
+            )
+            _append_event(conn, task_id, "budget_yielded_blocked", {
+                "reason": "continuation_exhausted",
+                "continuation_count": count,
+            })
+            return "blocked"
+        
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(conn, task_id, "budget_yielded", {
+            "handoff": handoff_summary[:200] if handoff_summary else None,
+            "billed": billable_tokens,
+            "max": max_total_tokens,
+            "continuation_count": count,
+        })
+        return "ready"
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 

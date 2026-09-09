@@ -2241,6 +2241,21 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    # -- Token-budget init (Kanban workers only) -------------------------
+    # When HERMES_KANBAN_MAX_TOTAL_TOKENS is set, wire a TokenBudget
+    # that coexists with IterationBudget. Both count independently.
+    _kanban_token_cap = os.environ.get("HERMES_KANBAN_MAX_TOTAL_TOKENS")
+    if _kanban_token_cap is not None:
+        try:
+            from agent.kanban_budget import TokenBudget
+            _cont_count = int(os.environ.get("HERMES_KANBAN_BUDGET_CONTINUATION_COUNT", "0"))
+            agent._token_budget = TokenBudget(
+                max_total_tokens=int(_kanban_token_cap),
+                continuation_count=_cont_count,
+            )
+            agent._token_budget_exhausted = False
+        except (ValueError, TypeError):
+            logger.warning("Invalid HERMES_KANBAN_MAX_TOTAL_TOKENS — skipping token budget")
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -2276,6 +2291,18 @@ def run_conversation(
             _turn_exit_reason = "interrupted_by_user"
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
+            break
+
+        # Check for token-budget exhaustion (Kanban worker ceiling).
+        if getattr(agent, "_token_budget_exhausted", False):
+            _tb = getattr(agent, "_token_budget", None)
+            _turn_exit_reason = "token_budget_yielded"
+            if not agent.quiet_mode and _tb is not None:
+                agent._safe_print(
+                    f"\n💰 Token budget exhausted — yielding. "
+                    f"Billed: {_tb.billable_tokens:,} / "
+                    f"{_tb.max_total_tokens:,} tokens"
+                )
             break
 
         # Aggregate input budget for detached auxiliary forks (background
@@ -4748,6 +4775,21 @@ def run_conversation(
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                    # -- Token-budget accrual (Kanban worker budget ceiling) ------
+                    # Per-call usage snapshot -> BudgetSnapshot -> TokenBudget.consume().
+                    _tb = getattr(agent, "_token_budget", None)
+                    if _tb is not None:
+                        from agent.kanban_budget import BudgetSnapshot
+                        _snap = BudgetSnapshot.from_usage(canonical_usage)
+                        _tb.consume(_snap)
+                        if _tb.should_warn and not agent.quiet_mode:
+                            agent._safe_print(
+                                f"\n\u26a0\ufe0f  Token budget 75% used: "
+                                f"{_tb.billable_tokens:,} / {_tb.max_total_tokens:,} tokens "
+                                f"({_tb.fraction_used:.0%}). Consider checkpointing."
+                            )
+                        if _tb.is_exhausted:
+                            agent._token_budget_exhausted = True
                     # Rolling history for status-bar averages (last 10).
                     try:
                         hist = getattr(agent, "_api_latency_history", None)
