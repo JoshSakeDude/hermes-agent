@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -1123,6 +1124,12 @@ class Task:
     # leader size a big card's budget up front rather than watching it hit the
     # global wall and blind-retry.
     max_iterations: Optional[int] = None
+    # Per-task token ceiling. When set, the task's total token consumption
+    # (billable_tokens) must not exceed this. NULL = no ceiling.
+    max_total_tokens: Optional[int] = None
+    # Per-task estimated-cost ceiling in USD. Stored as TEXT for Decimal
+    # precision; hydrated back to Decimal by from_row(). NULL = no ceiling.
+    max_estimated_cost_usd: Optional["Decimal"] = None
     # When True, the dispatched worker runs in a Ralph-style goal loop
     # (the same engine behind the ``/goal`` slash command): after each
     # turn an auxiliary judge model evaluates the worker's response
@@ -1229,6 +1236,16 @@ class Task:
             max_iterations=(
                 row["max_iterations"]
                 if "max_iterations" in keys and row["max_iterations"]
+                else None
+            ),
+            max_total_tokens=(
+                row["max_total_tokens"]
+                if "max_total_tokens" in keys and row["max_total_tokens"]
+                else None
+            ),
+            max_estimated_cost_usd=(
+                Decimal(row["max_estimated_cost_usd"])
+                if "max_estimated_cost_usd" in keys and row["max_estimated_cost_usd"]
                 else None
             ),
             goal_mode=(
@@ -1413,6 +1430,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- agent.max_turns default. NULL = use the global default (existing
     -- behaviour; existing rows unaffected).
     max_iterations       INTEGER,
+    -- Per-task token ceiling — when set, the worker's total billable
+    -- tokens must not exceed this. NULL = no ceiling (pre-existing rows
+    -- and tasks that never set a ceiling are unaffected).
+    max_total_tokens     INTEGER,
+    -- Per-task estimated-cost ceiling in USD. Stored as TEXT so Decimal
+    -- precision survives the TEXT→Decimal round-trip without truncation.
+    max_estimated_cost_usd TEXT,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -2691,6 +2715,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "max_iterations", "max_iterations INTEGER"
         )
 
+    if "max_total_tokens" not in cols:
+        # Per-task token ceiling. NULL = no ceiling (existing rows unaffected,
+        # tasks that never set a ceiling run exactly as before).
+        _add_column_if_missing(
+            conn, "tasks", "max_total_tokens", "max_total_tokens INTEGER"
+        )
+
+    if "max_estimated_cost_usd" not in cols:
+        # Per-task estimated-cost ceiling. Stored as TEXT for Decimal
+        # precision. NULL = no ceiling.
+        _add_column_if_missing(
+            conn, "tasks", "max_estimated_cost_usd", "max_estimated_cost_usd TEXT"
+        )
+
     if "session_id" not in cols:
         # Originating agent/chat session id, populated when the task is
         # created from within an agent loop that propagated
@@ -3211,6 +3249,8 @@ def create_task(
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
     max_iterations: Optional[int] = None,
+    max_total_tokens: Optional[int] = None,
+    max_estimated_cost_usd: Optional["Decimal"] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
@@ -3536,8 +3576,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
-                        max_iterations
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        max_iterations, max_total_tokens, max_estimated_cost_usd
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3564,6 +3604,8 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         int(max_iterations) if max_iterations is not None else None,
+                        int(max_total_tokens) if max_total_tokens is not None else None,
+                        str(max_estimated_cost_usd) if max_estimated_cost_usd is not None else None,
                     ),
                 )
                 for pid in parents:
