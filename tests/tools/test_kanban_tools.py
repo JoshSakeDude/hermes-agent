@@ -80,6 +80,22 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_create_accepts_token_and_cost_limits(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    data = json.loads(kt._handle_create({
+        "title": "bounded child",
+        "assignee": "test-worker",
+        "max_total_tokens": 12000,
+        "max_estimated_cost_usd": 2.5,
+    }))
+    with kb.connect() as conn:
+        task = kb.get_task(conn, data["task_id"])
+    assert task.max_total_tokens == 12000
+    assert str(task.max_estimated_cost_usd) == "2.5"
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

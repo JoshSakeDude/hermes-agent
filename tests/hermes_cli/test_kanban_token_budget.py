@@ -1020,3 +1020,27 @@ def test_budget_yield_persists_structured_checkpoint(kanban_home):
     assert run.metadata["progress_marker"] == "tree-1"
     assert run.metadata["changed_files"] == ["agent/loop.py"]
     assert run.metadata["test_evidence"] == "52 passed in 6.71s"
+
+
+def test_cli_json_surface_includes_budget_limits(kanban_home):
+    from hermes_cli.kanban import _task_to_dict
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="surface",
+            max_total_tokens=1234,
+            max_estimated_cost_usd=Decimal("1.25"),
+        )
+        payload = _task_to_dict(kb.get_task(conn, task_id))
+
+    assert payload["max_total_tokens"] == 1234
+    assert payload["max_estimated_cost_usd"] == "1.25"
+
+
+def test_agent_create_schema_advertises_budget_limits():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert props["max_total_tokens"]["type"] == "integer"
+    assert props["max_estimated_cost_usd"]["type"] == "number"

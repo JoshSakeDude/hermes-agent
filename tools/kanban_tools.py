@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from decimal import Decimal
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -1430,6 +1431,8 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
     max_iterations = args.get("max_iterations")
+    max_total_tokens = args.get("max_total_tokens")
+    max_estimated_cost_usd = args.get("max_estimated_cost_usd")
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1481,6 +1484,13 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 max_iterations=(
                     int(max_iterations) if max_iterations is not None else None
+                ),
+                max_total_tokens=(
+                    int(max_total_tokens) if max_total_tokens is not None else None
+                ),
+                max_estimated_cost_usd=(
+                    Decimal(str(max_estimated_cost_usd))
+                    if max_estimated_cost_usd is not None else None
                 ),
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
@@ -2273,6 +2283,17 @@ KANBAN_CREATE_SCHEMA = {
                     "routes to blocked (needs human) rather than "
                     "auto-retrying into the same wall."
                 ),
+            },
+            "max_total_tokens": {
+                "type": "integer",
+                "description": (
+                    "Per-card billable-token ceiling. Near the limit the worker "
+                    "checkpoints, then yields without stalling unrelated work."
+                ),
+            },
+            "max_estimated_cost_usd": {
+                "type": "number",
+                "description": "Optional estimated-cost ceiling in USD.",
             },
             "initial_status": {
                 "type": "string",

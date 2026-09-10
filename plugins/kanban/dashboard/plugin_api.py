@@ -42,6 +42,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
@@ -162,6 +163,8 @@ def _task_dict(
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    if task.max_estimated_cost_usd is not None:
+        d["max_estimated_cost_usd"] = str(task.max_estimated_cost_usd)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -612,6 +615,8 @@ class CreateTaskBody(BaseModel):
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
     max_iterations: Optional[int] = None
+    max_total_tokens: Optional[int] = None
+    max_estimated_cost_usd: Optional[Decimal] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     # Per-task thinking depth (none|minimal|…|ultra). None = inherit the
@@ -645,6 +650,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
             max_iterations=payload.max_iterations,
+            max_total_tokens=payload.max_total_tokens,
+            max_estimated_cost_usd=payload.max_estimated_cost_usd,
             model_override=payload.model_override,
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,

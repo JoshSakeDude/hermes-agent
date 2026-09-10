@@ -713,7 +713,7 @@ To disable without removing: add `dashboard.plugins.kanban.enabled: false` to `c
 
 ### Scope boundary
 
-The GUI is deliberately thin. Everything the plugin does is reachable from the CLI; the plugin just makes it comfortable for humans. Auto-assignment, budgets, governance gates, and org-chart views remain user-space — a router profile, another plugin, or a reuse of `tools/approval.py` — exactly as listed in the out-of-scope section of the design spec.
+The GUI is deliberately thin. Everything the plugin does is reachable from the CLI; the plugin just makes it comfortable for humans. Auto-assignment, governance gates, and org-chart views remain user-space — a router profile, another plugin, or a reuse of `tools/approval.py` — exactly as listed in the out-of-scope section of the design spec. Per-card token and estimated-cost ceilings are enforced by the built-in worker lifecycle.
 
 ## CLI command reference
 
@@ -728,6 +728,9 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
                                 [--max-retries N]
+                                [--max-iterations N]
+                                [--max-total-tokens N]
+                                [--max-estimated-cost-usd AMOUNT]
                                 [--goal] [--goal-max-turns N]
                                 [--skill <name>]...
                                 [--json]
@@ -786,6 +789,19 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+
+### Per-card token budgets and yielding
+
+`--max-total-tokens` limits uncached input plus output tokens for each worker run. `--max-estimated-cost-usd` supplies an optional estimated-cost ceiling. Both values are also available through `kanban_create` and the dashboard API, and appear in task JSON.
+
+Budget enforcement is a cooperative yield, not a hard process kill:
+
+1. At 75% the worker receives one checkpoint warning.
+2. At the ceiling it receives two finalization turns to finish an atomic edit or test, collect the current commit, changed files, and test evidence, and write a structured handoff.
+3. The dispatcher releases the task and puts the continuation behind fresh runnable work so one expensive card cannot stall the queue.
+4. A repeated identical checkpoint blocks the task as no-progress. A task that reaches the continuation limit also blocks and should be decomposed before another attempt.
+
+Tasks without either budget field retain the existing unlimited behavior. Cached-read tokens remain visible in usage accounting but do not consume the per-run ceiling.
 
 ### Concurrency, scheduling, and child promotion config
 

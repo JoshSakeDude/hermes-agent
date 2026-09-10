@@ -21,6 +21,7 @@ import os
 import shlex
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
@@ -77,6 +78,11 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "max_iterations": t.max_iterations,
+        "max_total_tokens": t.max_total_tokens,
+        "max_estimated_cost_usd": (
+            str(t.max_estimated_cost_usd)
+            if t.max_estimated_cost_usd is not None else None
+        ),
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
@@ -439,6 +445,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "default for this card only. Size it up for large "
                                "tasks so they don't hit the global wall and block. "
                                "Unset = global default.")
+    p_create.add_argument("--max-total-tokens", type=int, default=None,
+                          metavar="N", dest="max_total_tokens",
+                          help="Per-card billable-token ceiling; checkpoint and "
+                               "yield instead of failing at the limit.")
+    p_create.add_argument("--max-estimated-cost-usd", type=Decimal, default=None,
+                          metavar="USD", dest="max_estimated_cost_usd",
+                          help="Optional estimated-cost ceiling in USD.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1677,6 +1690,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    max_total_tokens = getattr(args, "max_total_tokens", None)
+    if max_total_tokens is not None and max_total_tokens < 1:
+        print("kanban: --max-total-tokens must be >= 1.", file=sys.stderr)
+        return 2
+    max_estimated_cost_usd = getattr(args, "max_estimated_cost_usd", None)
+    if max_estimated_cost_usd is not None and max_estimated_cost_usd <= 0:
+        print("kanban: --max-estimated-cost-usd must be > 0.", file=sys.stderr)
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1697,6 +1718,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
             max_iterations=max_iterations,
+            max_total_tokens=max_total_tokens,
+            max_estimated_cost_usd=max_estimated_cost_usd,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),

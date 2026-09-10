@@ -116,6 +116,21 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_task_round_trips_budget_limits(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "bounded",
+            "max_total_tokens": 42000,
+            "max_estimated_cost_usd": "3.75",
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["max_total_tokens"] == 42000
+    assert task["max_estimated_cost_usd"] == "3.75"
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
