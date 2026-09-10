@@ -130,6 +130,7 @@ def _record_kanban_token_budget_yielded(
     billable_tokens: int,
     max_total_tokens: int,
     logger,
+    checkpoint=None,
 ) -> None:
     """Record a cooperative ``budget_yielded`` outcome for a kanban worker
     that exhausted its token ceiling.
@@ -153,6 +154,7 @@ def _record_kanban_token_budget_yielded(
                 handoff_summary=handoff_summary,
                 billable_tokens=billable_tokens,
                 max_total_tokens=max_total_tokens,
+                checkpoint=checkpoint,
             )
         finally:
             try:
@@ -186,6 +188,22 @@ def _clone_background_review_messages(messages):
     from agent.conversation_loop import _clone_message_for_send
 
     return [_clone_message_for_send(message) for message in messages]
+
+
+
+def _token_budget_signal(agent):
+    """Build a serializable token-budget yield signal for the result dict."""
+    _tb = getattr(agent, "_token_budget", None)
+    if _tb is None:
+        return None
+    return {
+        "max_total_tokens": _tb.max_total_tokens,
+        "billable_tokens": _tb.billable_tokens,
+        "remaining": _tb.remaining,
+        "fraction_used": _tb.fraction_used,
+        "exhausted": getattr(agent, "_token_budget_exhausted", False),
+        "continuation_count": _tb.continuation_count,
+    }
 
 
 def finalize_turn(
@@ -291,6 +309,32 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+            )
+
+    # Token-budget yield handoff -- cooperative, NOT a failure.
+    if str(_turn_exit_reason) == "token_budget_yielded":
+        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        _tb = getattr(agent, "_token_budget", None)
+        if _kanban_task and _tb is not None:
+            from agent.kanban_budget import build_workspace_checkpoint
+            _checkpoint = build_workspace_checkpoint(
+                os.environ.get("HERMES_KANBAN_WORKSPACE", os.getcwd()), messages,
+            )
+            _changed = _checkpoint.get("changed_files") or []
+            _tests = _checkpoint.get("test_evidence") or "not observed"
+            _record_kanban_token_budget_yielded(
+                _kanban_task,
+                handoff_summary=(
+                    f"Token budget exhausted: "
+                    f"{_tb.billable_tokens:,} / {_tb.max_total_tokens:,} tokens; "
+                    f"changed files: {', '.join(_changed[:10]) or 'none'}; "
+                    f"tests: {_tests}; next: inspect this checkpoint and finish "
+                    f"the remaining acceptance criteria"
+                ),
+                billable_tokens=_tb.billable_tokens,
+                max_total_tokens=_tb.max_total_tokens,
+                logger=logger,
+                checkpoint=_checkpoint,
             )
 
     # Determine if conversation completed successfully
@@ -802,6 +846,7 @@ def finalize_turn(
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
+        "token_budget": _token_budget_signal(agent),
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

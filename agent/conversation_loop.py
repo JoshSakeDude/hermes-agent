@@ -195,6 +195,51 @@ def _review_input_budget_exhausted(agent: Any) -> bool:
     return isinstance(used, int) and not isinstance(used, bool) and used >= budget
 
 
+def _apply_kanban_budget_usage(agent: Any, canonical_usage: Any) -> tuple[bool, bool]:
+    """Accrue one provider response and return ``(warned, finalizing)``."""
+    budget = getattr(agent, "_token_budget", None)
+    if budget is None:
+        return False, False
+
+    from agent.kanban_budget import BudgetSnapshot
+
+    budget.consume(BudgetSnapshot.from_usage(canonical_usage))
+    warned = budget.should_warn
+    if warned:
+        agent._token_budget_warning_pending = True
+
+    finalizing = False
+    if budget.is_exhausted:
+        budget.enter_finalization(allowance=2)
+        finalizing = budget.finalization_remaining > 0
+    return warned, finalizing
+
+
+def _prepare_kanban_budget_request(agent: Any, messages: list[dict]) -> bool:
+    """Inject one checkpoint nudge and gate the next provider request."""
+    if getattr(agent, "_token_budget_warning_pending", False):
+        append_message(
+            messages,
+            {
+                "role": "user",
+                "content": (
+                    "[TOKEN BUDGET CHECKPOINT] The run is nearing its token ceiling. "
+                    "Finish the current atomic edit or test, then record changed "
+                    "files, test evidence, and the exact remaining step. Do not "
+                    "start a new workstream."
+                ),
+                "_token_budget_checkpoint_synthetic": True,
+            },
+        )
+        agent._token_budget_warning_pending = False
+
+    budget = getattr(agent, "_token_budget", None)
+    if budget is None or budget.allow_next_request():
+        return True
+    agent._token_budget_exhausted = True
+    return False
+
+
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
     """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
 
@@ -2293,9 +2338,15 @@ def run_conversation(
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
 
-        # Check for token-budget exhaustion (Kanban worker ceiling).
+        # Token-budget management (Kanban worker ceiling).
+        # Finalization allows a bounded number of grace turns after the
+        # ceiling is hit — the model gets to finish cleanly, then the
+        # worker yields.  When finalization runs out the hard exhaustion
+        # flag is set and the loop breaks on the next pass.
+        _tb = getattr(agent, "_token_budget", None)
+        _prepare_kanban_budget_request(agent, messages)
+
         if getattr(agent, "_token_budget_exhausted", False):
-            _tb = getattr(agent, "_token_budget", None)
             _turn_exit_reason = "token_budget_yielded"
             if not agent.quiet_mode and _tb is not None:
                 agent._safe_print(
@@ -4779,17 +4830,24 @@ def run_conversation(
                     # Per-call usage snapshot -> BudgetSnapshot -> TokenBudget.consume().
                     _tb = getattr(agent, "_token_budget", None)
                     if _tb is not None:
-                        from agent.kanban_budget import BudgetSnapshot
-                        _snap = BudgetSnapshot.from_usage(canonical_usage)
-                        _tb.consume(_snap)
-                        if _tb.should_warn and not agent.quiet_mode:
+                        _warned, _finalizing = _apply_kanban_budget_usage(
+                            agent, canonical_usage,
+                        )
+                        if _warned and not agent.quiet_mode:
                             agent._safe_print(
                                 f"\n\u26a0\ufe0f  Token budget 75% used: "
                                 f"{_tb.billable_tokens:,} / {_tb.max_total_tokens:,} tokens "
                                 f"({_tb.fraction_used:.0%}). Consider checkpointing."
                             )
-                        if _tb.is_exhausted:
-                            agent._token_budget_exhausted = True
+                        if _finalizing and not agent.quiet_mode:
+                            agent._safe_print(
+                                f"\n💰 Token ceiling reached "
+                                f"({_tb.billable_tokens:,} / "
+                                f"{_tb.max_total_tokens:,} tokens) — "
+                                f"entering finalization "
+                                f"({_tb.finalization_remaining} turns)"
+                            )
+
                     # Rolling history for status-bar averages (last 10).
                     try:
                         hist = getattr(agent, "_api_latency_history", None)

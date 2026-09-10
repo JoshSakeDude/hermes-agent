@@ -9465,6 +9465,8 @@ def _finalize_budget_yielded(
     handoff_summary='',
     billable_tokens=0,
     max_total_tokens=0,
+    progress_marker=None,
+    checkpoint=None,
 ):
     """Handle a token-budget yield: end the current run with outcome
     ``budget_yielded``, release the claim, increment the continuation
@@ -9481,16 +9483,46 @@ def _finalize_budget_yielded(
     Returns the new status ("ready" or "blocked").
     """
     from agent.kanban_budget import MAX_BUDGET_CONTINUATIONS
-    now = int(time.time())
     with write_txn(conn):
-        _end_run(
+        task_row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return "blocked"
+        if task_row["current_run_id"] is None:
+            # Idempotent receipt: a duplicate finalizer cannot consume another
+            # continuation or change a card that the first receipt already moved.
+            return str(task_row["status"])
+
+        checkpoint = dict(checkpoint or {})
+        progress_marker = progress_marker or checkpoint.get("progress_marker")
+        prior_marker = None
+        prior_run = conn.execute(
+            "SELECT metadata FROM task_runs "
+            "WHERE task_id = ? AND outcome = 'budget_yielded' "
+            "AND ended_at IS NOT NULL ORDER BY ended_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if prior_run and prior_run["metadata"]:
+            try:
+                prior_marker = json.loads(prior_run["metadata"]).get("progress_marker")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                prior_marker = None
+
+        closed_run_id = _end_run(
             conn, task_id, outcome='budget_yielded',
             summary=handoff_summary[:500] if handoff_summary else None,
             metadata={
                 'billable_tokens': billable_tokens,
                 'max_total_tokens': max_total_tokens,
+                'progress_marker': progress_marker,
+                'commit': checkpoint.get('commit'),
+                'changed_files': checkpoint.get('changed_files') or [],
+                'test_evidence': checkpoint.get('test_evidence'),
             },
         )
+        if closed_run_id is None:
+            return str(task_row["status"])
         conn.execute(
             """UPDATE tasks
                SET claim_lock = NULL, claim_expires = NULL,
@@ -9510,13 +9542,14 @@ def _finalize_budget_yielded(
         ).fetchone()
         count = int(row["budget_continuation_count"]) if row else 0
         
-        if count >= MAX_BUDGET_CONTINUATIONS:
+        no_progress = bool(progress_marker) and progress_marker == prior_marker
+        if no_progress or count >= MAX_BUDGET_CONTINUATIONS:
             conn.execute(
                 "UPDATE tasks SET status = 'blocked' WHERE id = ?",
                 (task_id,),
             )
             _append_event(conn, task_id, "budget_yielded_blocked", {
-                "reason": "continuation_exhausted",
+                "reason": "no_progress" if no_progress else "continuation_exhausted",
                 "continuation_count": count,
             })
             return "blocked"
@@ -10227,7 +10260,8 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "ORDER BY (budget_continuation_count > 0) ASC, "
+        "priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.

@@ -604,19 +604,9 @@ def test_budget_yielded_blocks_on_third_exhaustion(kanban_home):
             max_total_tokens=50_000,
         )
         host = kb._claimer_id().split(":", 1)[0]
-
-        for _ in range(2):
-            kb.claim_task(conn, t, claimer=f"{host}:worker")
-            # Reset connection for next claim, return to active
-            conn.execute(
-                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
-                "worker_pid = NULL, current_run_id = NULL "
-                "WHERE id = ?", (t,)
-            )
-            conn.execute(
-                "UPDATE tasks SET budget_continuation_count = budget_continuation_count + 1 "
-                "WHERE id = ?", (t,)
-            )
+        conn.execute(
+            "UPDATE tasks SET budget_continuation_count = 2 WHERE id = ?", (t,)
+        )
         conn.commit()
 
     # After 2 continuations, this yield should block.
@@ -716,3 +706,317 @@ def test_token_budget_yield_signal_at_hard_ceiling():
     tb.consume_finalization_turn()
     assert tb.finalization_remaining == 0
     assert tb.is_exhausted is True
+
+
+# ============================================================================
+# Phase B1R — agent-loop integration: finalization, yield signal, handoff
+# ============================================================================
+
+
+def test_token_budget_finalization_enters_on_exhaustion():
+    """When billable hits ceiling, finalization enters automatically
+    (agent-loop simulation: consume → check → enter → consume turns)."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=10_000)
+    snap = BudgetSnapshot(input_tokens=10_000)
+    tb.consume(snap)
+
+    # First time hitting ceiling — should enter finalization
+    assert tb.is_exhausted is True
+    assert tb.finalization_remaining == 0
+    tb.enter_finalization(allowance=2)
+    assert tb.finalization_remaining == 2
+    assert tb.is_exhausted is False  # protected by finalization
+
+
+def test_token_budget_finalization_consumes_turns_to_exhaustion():
+    """After entering finalization, consuming all turns re-exhausts the budget."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=10_000)
+    snap = BudgetSnapshot(input_tokens=10_000)
+    tb.consume(snap)
+    tb.enter_finalization(allowance=2)
+
+    # Consume one turn
+    tb.consume_finalization_turn()
+    assert tb.finalization_remaining == 1
+    assert tb.is_exhausted is False
+
+    # Consume the last turn
+    tb.consume_finalization_turn()
+    assert tb.finalization_remaining == 0
+    assert tb.is_exhausted is True
+
+
+def test_token_budget_finalization_does_nothing_when_unbounded():
+    """No-ceiling cards should never enter finalization (exhaustion never fires)."""
+    from agent.kanban_budget import TokenBudget
+
+    tb = TokenBudget(max_total_tokens=None)
+    assert not tb.is_exhausted
+    assert tb.finalization_remaining == 0
+    # enter_finalization on unbounded is harmless but a noop
+    tb.enter_finalization(allowance=3)
+    assert tb.finalization_remaining == 0
+    assert not tb.is_exhausted  # unlimited
+
+
+def test_token_budget_yield_signal_structured():
+    """The budget yield signal carries max, billed, remaining, fraction, and
+    continuation count to downstream consumers."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000, continuation_count=1)
+    snap = BudgetSnapshot(input_tokens=100_000)
+    tb.consume(snap)
+    tb.enter_finalization(allowance=1)
+    tb.consume_finalization_turn()
+
+    assert tb.is_exhausted is True
+    assert tb.max_total_tokens == 100_000
+    assert tb.billable_tokens == 100_000
+    assert tb.remaining == 0
+    assert tb.fraction_used == 1.0
+    assert tb.continuation_count == 1
+    assert tb.finalization_remaining == 0
+
+
+def test_token_budget_warn_exactly_once_in_loop_context():
+    """Warning fires exactly once when 75% threshold is crossed during
+    successive consumes, simulating agent-loop accrual."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100_000)
+    # Below 75% — no warning
+    snap1 = BudgetSnapshot(input_tokens=70_000)
+    tb.consume(snap1)
+    assert not tb.should_warn
+
+    # Cross 75% — warning fires
+    snap2 = BudgetSnapshot(input_tokens=10_000)
+    tb.consume(snap2)
+    assert tb.fraction_used >= 0.75
+    assert tb.should_warn
+
+    # After warning, should_warn stays False
+    snap3 = BudgetSnapshot(input_tokens=10_000)
+    tb.consume(snap3)
+    assert not tb.should_warn
+
+
+def test_token_budget_no_ceiling_card_never_yields():
+    """When max_total_tokens is None, the TokenBudget never exhausts,
+    never finalizes, and never sets the exhaustion flag."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=None)
+    snap = BudgetSnapshot(input_tokens=999_999)
+    tb.consume(snap)
+    assert not tb.is_exhausted
+    assert tb.remaining is None
+    assert not tb.should_warn
+    # Fraction_used should be 0.0 for unbounded (not 1.0)
+    assert tb.fraction_used == 0.0
+
+
+def test_budget_exhaustion_without_finalization_halts():
+    """If finalization allowance is 0 (or never entered), exhaustion
+    is immediate — the budget yields with no grace."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=5_000)
+    snap = BudgetSnapshot(input_tokens=5_000)
+    tb.consume(snap)
+    # No finalization entered → exhausted immediately
+    assert tb.is_exhausted
+    assert tb.finalization_remaining == 0
+
+
+def test_pre_request_gate_allows_exactly_two_finalization_calls():
+    """A two-call grace window admits two provider calls, then yields."""
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=5_000)
+    tb.consume(BudgetSnapshot(input_tokens=5_000))
+    tb.enter_finalization(allowance=2)
+
+    assert tb.allow_next_request() is True
+    assert tb.finalization_remaining == 1
+    assert tb.allow_next_request() is True
+    assert tb.finalization_remaining == 0
+    assert tb.allow_next_request() is False
+
+
+def test_unbounded_budget_does_not_enter_finalization():
+    """Grace state is meaningful only for a configured finite ceiling."""
+    from agent.kanban_budget import TokenBudget
+
+    tb = TokenBudget(max_total_tokens=None)
+    tb.enter_finalization(allowance=2)
+
+    assert tb.finalization_remaining == 0
+    assert tb.allow_next_request() is True
+
+
+def test_loop_usage_helper_warns_once_and_starts_finalization():
+    """The production loop helper consumes canonical usage and emits state once."""
+    from types import SimpleNamespace
+
+    from agent.conversation_loop import _apply_kanban_budget_usage
+    from agent.kanban_budget import TokenBudget
+    from agent.usage_pricing import CanonicalUsage
+
+    agent = SimpleNamespace(_token_budget=TokenBudget(max_total_tokens=100))
+
+    warned, finalizing = _apply_kanban_budget_usage(
+        agent, CanonicalUsage(input_tokens=75, request_count=1)
+    )
+    assert warned is True
+    assert finalizing is False
+    assert agent._token_budget_warning_pending is True
+
+    warned, finalizing = _apply_kanban_budget_usage(
+        agent, CanonicalUsage(input_tokens=25, request_count=1)
+    )
+    assert warned is False
+    assert finalizing is True
+    assert agent._token_budget.finalization_remaining == 2
+
+
+def test_loop_request_gate_injects_checkpoint_guidance_once_then_yields():
+    """The model sees one checkpoint nudge and gets exactly two grace calls."""
+    from types import SimpleNamespace
+
+    from agent.conversation_loop import _prepare_kanban_budget_request
+    from agent.kanban_budget import BudgetSnapshot, TokenBudget
+
+    tb = TokenBudget(max_total_tokens=100)
+    tb.consume(BudgetSnapshot(input_tokens=100))
+    tb.enter_finalization(allowance=2)
+    agent = SimpleNamespace(
+        _token_budget=tb,
+        _token_budget_warning_pending=True,
+        _token_budget_exhausted=False,
+    )
+    messages = []
+
+    assert _prepare_kanban_budget_request(agent, messages) is True
+    assert len(messages) == 1
+    assert "checkpoint" in messages[0]["content"].lower()
+    assert _prepare_kanban_budget_request(agent, messages) is True
+    assert len(messages) == 1
+    assert _prepare_kanban_budget_request(agent, messages) is False
+    assert agent._token_budget_exhausted is True
+
+
+def test_budget_yield_finalization_is_idempotent(kanban_home):
+    """A duplicate finalizer call cannot increment the continuation twice."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="yield once", assignee="gohanlite", max_total_tokens=100,
+        )
+        kb.claim_task(conn, task_id)
+
+    with kb.connect() as conn:
+        assert kb._finalize_budget_yielded(conn, task_id, billable_tokens=100) == "ready"
+        assert kb._finalize_budget_yielded(conn, task_id, billable_tokens=100) == "ready"
+        task = kb.get_task(conn, task_id)
+        assert task.budget_continuation_count == 1
+
+
+def test_budget_yield_blocks_immediately_on_unchanged_progress_marker(kanban_home):
+    """Two identical checkpoints indicate spinning and must not auto-continue."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="spinning", assignee="gohanlite", max_total_tokens=100,
+        )
+        kb.claim_task(conn, task_id)
+        assert kb._finalize_budget_yielded(
+            conn, task_id, billable_tokens=100, progress_marker="same-tree",
+        ) == "ready"
+        kb.claim_task(conn, task_id)
+        assert kb._finalize_budget_yielded(
+            conn, task_id, billable_tokens=100, progress_marker="same-tree",
+        ) == "blocked"
+
+        events = kb.list_events(conn, task_id)
+        blocked = [event for event in events if event.kind == "budget_yielded_blocked"]
+        assert blocked[-1].payload["reason"] == "no_progress"
+
+
+def test_dispatch_puts_yielded_continuation_behind_fresh_work(
+    kanban_home, monkeypatch,
+):
+    """A yielded card stays runnable but fresh work gets the next slot."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
+    spawned = []
+
+    with kb.connect() as conn:
+        yielded = kb.create_task(conn, title="yielded", assignee="worker", priority=10)
+        fresh = kb.create_task(conn, title="fresh", assignee="worker", priority=10)
+        conn.execute(
+            "UPDATE tasks SET budget_continuation_count = 1 WHERE id = ?", (yielded,)
+        )
+        conn.commit()
+
+        kb.dispatch_once(
+            conn,
+            max_spawn=1,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+
+    assert spawned == [fresh]
+
+
+def test_workspace_checkpoint_tracks_git_progress_and_test_evidence(tmp_path):
+    """Yield checkpoints carry a stable tree marker, changed files, and tests."""
+    import subprocess
+
+    from agent.kanban_budget import build_workspace_checkpoint
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    tracked.write_text("two\n", encoding="utf-8")
+
+    checkpoint = build_workspace_checkpoint(
+        str(tmp_path),
+        [{"role": "tool", "content": "52 passed in 6.71s"}],
+    )
+
+    assert checkpoint["progress_marker"]
+    assert checkpoint["commit"]
+    assert "tracked.txt" in checkpoint["changed_files"]
+    assert checkpoint["test_evidence"] == "52 passed in 6.71s"
+
+
+def test_budget_yield_persists_structured_checkpoint(kanban_home):
+    """The continuation reads concrete changes/tests from prior run metadata."""
+    checkpoint = {
+        "progress_marker": "tree-1",
+        "commit": "abc123",
+        "changed_files": ["agent/loop.py"],
+        "test_evidence": "52 passed in 6.71s",
+    }
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="checkpoint", assignee="gohanlite", max_total_tokens=100,
+        )
+        kb.claim_task(conn, task_id)
+        kb._finalize_budget_yielded(
+            conn, task_id, billable_tokens=100, checkpoint=checkpoint,
+        )
+        run = kb.latest_run(conn, task_id)
+
+    assert run.metadata["progress_marker"] == "tree-1"
+    assert run.metadata["changed_files"] == ["agent/loop.py"]
+    assert run.metadata["test_evidence"] == "52 passed in 6.71s"

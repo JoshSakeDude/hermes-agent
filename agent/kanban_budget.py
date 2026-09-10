@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+import hashlib
+import re
+import subprocess
 from typing import Optional
 
 
@@ -100,6 +103,49 @@ MAX_BUDGET_CONTINUATIONS = 2
 BUDGET_YIELDED_OUTCOME = "budget_yielded"
 
 WARN_FRACTION = 0.75
+
+
+def build_workspace_checkpoint(workspace: str, messages: list[dict]) -> dict:
+    """Capture a content-free git progress marker and recent test evidence."""
+    checkpoint = {
+        "progress_marker": None,
+        "commit": None,
+        "changed_files": [],
+        "test_evidence": None,
+    }
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=workspace,
+            check=True, capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=workspace, check=True, capture_output=True, text=True, timeout=5,
+        ).stdout
+        changed_files = []
+        for line in status.splitlines():
+            path = line[3:] if len(line) > 3 else ""
+            if " -> " in path:
+                path = path.rsplit(" -> ", 1)[-1]
+            if path:
+                changed_files.append(path)
+        checkpoint.update(
+            progress_marker=hashlib.sha256(
+                (commit + "\0" + status).encode("utf-8", errors="replace")
+            ).hexdigest(),
+            commit=commit,
+            changed_files=changed_files[:100],
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    passed_pattern = re.compile(r"\b\d+ passed(?:[^\n]*)", re.IGNORECASE)
+    for message in reversed(messages[-100:]):
+        match = passed_pattern.search(str(message.get("content", "")))
+        if match:
+            checkpoint["test_evidence"] = match.group(0)[:200]
+            break
+    return checkpoint
 
 
 class TokenBudget:
@@ -195,6 +241,8 @@ class TokenBudget:
 
     def enter_finalization(self, allowance: int) -> None:
         """Reserve allowance turns for atomic finish/revert + handoff."""
+        if self._max_total_tokens is None:
+            return
         self._finalization_turns = max(0, allowance)
         self._finalization_used = 0
 
@@ -205,6 +253,20 @@ class TokenBudget:
                 self._finalization_turns,
                 self._finalization_used + 1,
             )
+
+    def allow_next_request(self) -> bool:
+        """Admit a provider request, consuming grace only after the ceiling.
+
+        Once a finite budget has entered finalization, each admitted request
+        consumes one grace slot.  The following call returns ``False`` so the
+        conversation loop yields before starting another provider request.
+        """
+        if self._max_total_tokens is None or self.remaining != 0:
+            return True
+        if self.finalization_remaining <= 0:
+            return False
+        self.consume_finalization_turn()
+        return True
 
     # -- consumption ------------------------------------------------
 
@@ -245,6 +307,7 @@ class TokenBudget:
 __all__ = [
     "BudgetSnapshot",
     "TokenBudget",
+    "build_workspace_checkpoint",
     "BUDGET_YIELDED_OUTCOME",
     "MAX_BUDGET_CONTINUATIONS",
     "WARN_FRACTION",
