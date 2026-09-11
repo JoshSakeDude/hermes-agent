@@ -31,6 +31,9 @@ _LOCAL_PATH_RE = re.compile(
     r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
     r"[A-Za-z]:\\[^\s,;]+)"
 )
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(token|password|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+"
+)
 
 
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
@@ -42,11 +45,53 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
         force=True,
         redact_url_credentials=True,
     )
+    reason = _SECRET_ASSIGNMENT_RE.sub(r"\1=[REDACTED]", reason)
     reason = _LOCAL_PATH_RE.sub("[local path]", reason)
     reason = " ".join(reason.split())
     if len(reason) > limit:
         reason = reason[: limit - 1].rstrip() + "…"
     return reason
+
+
+def _fold_terminal_events(events: list[Any]) -> list[Any]:
+    """Fold only proven same-run terminal companions in one claimed batch."""
+    by_run: dict[int, list[Any]] = {}
+    for event in events:
+        run_id = getattr(event, "run_id", None)
+        if run_id is not None:
+            by_run.setdefault(int(run_id), []).append(event)
+
+    suppressed: set[int] = set()
+    for grouped in by_run.values():
+        kinds = {event.kind for event in grouped}
+        automatic_block = any(
+            event.kind == "blocked"
+            and bool((event.payload or {}).get("automatic"))
+            for event in grouped
+        )
+        if automatic_block and "gave_up" in kinds:
+            suppressed.update(
+                id(event) for event in grouped if event.kind == "gave_up"
+            )
+        if kinds.intersection({"blocked", "completed", "gave_up"}):
+            suppressed.update(
+                id(event)
+                for event in grouped
+                if event.kind in {"crashed", "timed_out"}
+            )
+    return [event for event in events if id(event) not in suppressed]
+
+
+def _failure_decision_suffix(payload: Optional[dict]) -> str:
+    """Render a persisted retry decision and sanitized next action."""
+    payload = payload or {}
+    decision = ""
+    if payload.get("retryable") is True:
+        decision = "; retry scheduled."
+    elif payload.get("retryable") is False:
+        decision = "; no retry."
+    hint = _safe_review_reason(payload.get("operator_hint"), 120)
+    return decision + (f" {hint}" if hint else "")
 
 
 def _resolve_auto_decompose_settings(
@@ -571,6 +616,7 @@ class GatewayKanbanWatchersMixin:
                     # exists on the board.
                     wake_handoff = ""
                     wake_review_detail = ""
+                    d["events"] = _fold_terminal_events(d["events"])
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -605,20 +651,23 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                                reason = f": {_safe_review_reason(ev.payload['reason'])}"
+                            msg = (
+                                f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked"
+                                f"{reason}{_failure_decision_suffix(ev.payload)}"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                err = f"\n{_safe_review_reason(ev.payload['error'], 200)}"
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up"
+                                f"{_failure_decision_suffix(ev.payload)}{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed"
+                                f"{_failure_decision_suffix(ev.payload)}"
                             )
                         elif kind == "timed_out":
                             limit = 0
@@ -626,7 +675,8 @@ class GatewayKanbanWatchersMixin:
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"(max_runtime={limit}s)"
+                                f"{_failure_decision_suffix(ev.payload)}"
                             )
                         elif kind == "status":
                             new_status = ""

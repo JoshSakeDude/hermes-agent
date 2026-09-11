@@ -4614,17 +4614,14 @@ class TestRunConversation:
         forever without ever tripping the failure_limit circuit breaker
         (issue #23216 / #29747 gap 2).
 
-        As of #29747, the exhaustion path routes through
-        ``kanban_db._record_task_failure(outcome="iteration_budget_exhausted")`` so the
-        ``consecutive_failures`` counter increments and the dispatcher's
-        ``failure_limit`` breaker eventually trips. The legacy
-        ``kanban_block`` call was replaced because blocked-outcome runs
-        bypass the failure counter.
+        The exhaustion path uses an exact dispatcher run receipt and creates a
+        sticky needs-input block so the same bounded task is not retried.
         """
         self._setup_agent(agent)
         agent.max_iterations = 2
 
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
 
         # Return a tool call for every iteration to exhaust the budget.
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -4657,7 +4654,7 @@ class TestRunConversation:
         assert result["completed"] is False
 
         # _record_task_failure should have been called exactly once for
-        # the exhaustion event, with an explicit causal outcome.
+        # the exhaustion event, with its dedicated outcome and run identity.
         assert mock_record_failure.call_count == 1, (
             f"Expected exactly 1 _record_task_failure call, "
             f"got {mock_record_failure.call_count}. "
@@ -4667,6 +4664,8 @@ class TestRunConversation:
         # Positional: (conn, task_id, ...)
         assert call.args[1] == "t_test_task_123"
         assert call.kwargs.get("outcome") == "iteration_budget_exhausted"
+        assert call.kwargs.get("expected_run_id") == 123
+        assert call.kwargs.get("sticky_block_kind") == "needs_input"
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")

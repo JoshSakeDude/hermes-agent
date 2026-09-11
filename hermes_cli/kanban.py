@@ -2345,11 +2345,16 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
-        return None
+        raise ValueError(
+            "dispatcher worker is missing required HERMES_KANBAN_RUN_ID"
+        )
     try:
-        return int(raw)
+        run_id = int(raw)
     except ValueError:
-        return None
+        raise ValueError("dispatcher worker has malformed HERMES_KANBAN_RUN_ID")
+    if run_id <= 0:
+        raise ValueError("dispatcher worker has malformed HERMES_KANBAN_RUN_ID")
+    return run_id
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):

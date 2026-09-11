@@ -84,7 +84,8 @@ def _capture_spawn_env(monkeypatch, tmp_path, *, max_iterations):
     profile = root / "profiles" / "gohanlite"
     profile.mkdir(parents=True)
     profile.joinpath("config.yaml").write_text(
-        "toolsets:\n  - hermes-cli\n", encoding="utf-8",
+        "agent:\n  max_turns: 12\ntoolsets:\n  - hermes-cli\n",
+        encoding="utf-8",
     )
     root.joinpath("config.yaml").write_text(
         "toolsets:\n  - kanban\n", encoding="utf-8",
@@ -134,6 +135,41 @@ def test_default_spawn_passes_task_max_iterations_as_cli_override(
     assert index < cmd.index("chat")
 
 
+def test_default_spawn_passes_card_override_before_chat(monkeypatch, tmp_path):
+    captured = _capture_spawn_env(monkeypatch, tmp_path, max_iterations=35)
+    cmd = captured["cmd"]
+
+    flag_index = cmd.index("--max-turns")
+    assert cmd[flag_index + 1] == "35"
+    assert flag_index < cmd.index("chat")
+
+
+def test_exact_35_turn_worker_argv_crosses_real_parser_boundary(
+    monkeypatch, tmp_path,
+):
+    """Regression for ``invalid choice: '35'`` from the live incident."""
+    import sys
+    from hermes_cli import main as hermes_main
+
+    cmd = _capture_spawn_env(
+        monkeypatch, tmp_path, max_iterations=35,
+    )["cmd"]
+    captured = {}
+    monkeypatch.setattr(
+        hermes_main, "cmd_chat",
+        lambda args: captured.update(command=args.command, max_turns=args.max_turns),
+    )
+    monkeypatch.setattr(hermes_main, "_prepare_agent_startup", lambda _args: None)
+    monkeypatch.setattr(sys, "argv", cmd)
+
+    # The console entry point strips --profile/-p before building the real
+    # argparse tree. Mock only the post-parse command handler.
+    hermes_main._apply_profile_override()
+    hermes_main.main()
+
+    assert captured == {"command": "chat", "max_turns": 35}
+
+
 def test_default_spawn_omits_max_iterations_when_unset(monkeypatch, tmp_path):
     """Unset card must NOT pin HERMES_MAX_ITERATIONS, so the worker resolves
     the global agent.max_turns default exactly as before this change.
@@ -154,7 +190,7 @@ def test_default_spawn_omits_max_iterations_when_unset(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_iteration_exhaustion_routes_to_blocked_not_ready(kanban_home):
+def test_iteration_exhaustion_routes_to_blocked_not_ready(kanban_home, monkeypatch):
     """A running task whose worker exhausts its iteration budget must land in
     ``blocked`` (human decision: resize/split), NOT be re-queued ``ready`` to
     blind-retry into the same wall."""
@@ -164,7 +200,9 @@ def test_iteration_exhaustion_routes_to_blocked_not_ready(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="too big", assignee="gohanlite")
         host = kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        claimed = kb.claim_task(conn, t, claimer=f"{host}:worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
     # The worker path connects on its own; point it at this board's DB.
     _record_kanban_budget_exhausted(
@@ -230,7 +268,9 @@ def test_iteration_exhaustion_routes_to_blocked_not_ready(kanban_home):
         assert len([e for e in events if e.kind == "blocked"]) == 1
 
 
-def test_iteration_exhaustion_replaces_historical_block_cause(kanban_home):
+def test_iteration_exhaustion_replaces_historical_block_cause(
+    kanban_home, monkeypatch,
+):
     """A prior capability block must not mask a later iteration exhaustion."""
     from agent.turn_finalizer import _record_kanban_budget_exhausted
     import logging
@@ -243,7 +283,9 @@ def test_iteration_exhaustion_replaces_historical_block_cause(kanban_home):
             conn, task_id, reason="old access issue", kind="capability",
         )
         assert kb.unblock_task(conn, task_id)
-        assert kb.claim_task(conn, task_id, claimer=f"{host}:second") is not None
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:second")
+        assert claimed is not None and claimed.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
     _record_kanban_budget_exhausted(
         task_id, api_call_count=30, max_iterations=30,

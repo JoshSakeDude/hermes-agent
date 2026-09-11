@@ -1,5 +1,6 @@
 """Regression tests for iteration-limit exit normalization (#61631)."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -168,6 +169,7 @@ def test_pending_response_does_not_mask_later_terminal_exit(
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
@@ -196,10 +198,16 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         force_trip=True,
         sticky_block_kind="needs_input",
         run_summary="composed report",
+        expected_run_id=123,
         event_payload_extra={
             "budget_used": 60,
             "budget_max": 60,
             "block_cause": "iteration_budget_exhausted",
+            "reason_code": "iteration_budget_exhausted",
+            "retryable": False,
+            "operator_hint": (
+                "Raise max_iterations or split the task, then unblock it."
+            ),
         },
     )
 
@@ -250,6 +258,7 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-456")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "456")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
@@ -279,6 +288,7 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     args, kwargs = record.call_args
     assert args[1] == "task-456"
     assert kwargs["outcome"] == "iteration_budget_exhausted"
+    assert kwargs["expected_run_id"] == 456
     assert kwargs["release_claim"] is True
     assert kwargs["end_run"] is True
     assert kwargs["event_payload_extra"]["budget_used"] == 60
@@ -291,6 +301,7 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-789")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "789")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
@@ -317,6 +328,80 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     args, kwargs = record.call_args
     assert args[1] == "task-789"
     assert kwargs["outcome"] == "iteration_budget_exhausted"
+    assert kwargs["expected_run_id"] == 789
+
+
+@pytest.mark.parametrize("run_id", [None, "not-a-run", "0", "-1"])
+def test_iteration_exhaustion_fails_closed_without_valid_run_identity(
+    monkeypatch, run_id,
+):
+    from agent.turn_finalizer import _record_kanban_budget_exhausted
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-identity")
+    if run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
+    connect = MagicMock(name="connect")
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", connect)
+
+    _record_kanban_budget_exhausted(
+        "task-identity", 35, 35, logging.getLogger("test"),
+    )
+
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize("run_id", [None, "not-a-run", "0", "-1"])
+def test_token_budget_yield_fails_closed_without_valid_run_identity(
+    monkeypatch, run_id,
+):
+    from agent.turn_finalizer import _record_kanban_token_budget_yielded
+
+    if run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
+    connect = MagicMock(name="connect")
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", connect)
+
+    _record_kanban_token_budget_yielded(
+        "task-token",
+        "handoff",
+        100,
+        100,
+        logging.getLogger("test"),
+    )
+
+    connect.assert_not_called()
+
+
+def test_token_budget_yield_passes_expected_run_identity(monkeypatch):
+    from agent.turn_finalizer import _record_kanban_token_budget_yielded
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "321")
+    finalize = MagicMock(name="finalize_budget_yielded")
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db._finalize_budget_yielded", finalize)
+
+    _record_kanban_token_budget_yielded(
+        "task-token",
+        "handoff",
+        100,
+        200,
+        logging.getLogger("test"),
+    )
+
+    finalize.assert_called_once_with(
+        conn,
+        "task-token",
+        handoff_summary="handoff",
+        billable_tokens=100,
+        max_total_tokens=200,
+        checkpoint=None,
+        expected_run_id=321,
+    )
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
