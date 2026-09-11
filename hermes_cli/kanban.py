@@ -2550,6 +2550,14 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
+    worker_task = os.environ.get("HERMES_KANBAN_TASK")
+    if worker_task:
+        print(
+            "kanban unblock refused: dispatcher workers cannot unblock tasks; "
+            "block and stop, then wait for an operator/orchestrator",
+            file=sys.stderr,
+        )
+        return 1
     ids = list(args.task_ids or [])
     if not ids:
         print("at least one task_id is required", file=sys.stderr)

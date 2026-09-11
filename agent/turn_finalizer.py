@@ -70,8 +70,9 @@ def _record_kanban_budget_exhausted(
     api_call_count: int,
     max_iterations: int,
     logger: logging.Logger,
+    handoff_summary: str | None = None,
 ) -> None:
-    """Record a terminal ``timed_out`` outcome for a kanban worker that
+    """Record a terminal iteration-exhausted outcome for a kanban worker that
     exhausted its iteration budget.
 
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
@@ -92,7 +93,7 @@ def _record_kanban_budget_exhausted(
                     "task too large for its budget; resize max_iterations "
                     "or split the task, then unblock"
                 ),
-                outcome="timed_out",
+                outcome="iteration_budget_exhausted",
                 release_claim=True,
                 end_run=True,
                 # Route iteration-cap exhaustion straight to blocked instead of
@@ -104,6 +105,8 @@ def _record_kanban_budget_exhausted(
                 # reviewer-run guard (a review run is never downgraded to an
                 # implementation retry) and scrubs the reason of secrets/PII.
                 force_trip=True,
+                sticky_block_kind="needs_input",
+                run_summary=handoff_summary,
                 event_payload_extra={
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
@@ -288,13 +291,15 @@ def finalize_turn(
         # came from the summary call or an explicitly pending continuation;
         # both exhausted the task budget and must advance the failure circuit.
         #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # Route through ``_record_task_failure`` with an explicit causal
+        # outcome rather than conflating iteration exhaustion with a wall-clock
+        # timeout. This still counts toward the dispatcher's consecutive-
+        # failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                handoff_summary=final_response,
             )
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the

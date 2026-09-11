@@ -432,6 +432,84 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_can_adopt_task_into_current_interactive_session(
+    monkeypatch, worker_env,
+):
+    """An orchestrator can own a new card without racing the dispatcher."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "desktop-session-1")
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "same-session task",
+        "assignee": "test-worker",
+        "adopt_current_session": True,
+    })
+    data = json.loads(out)
+
+    assert data["ok"] is True
+    assert data["status"] == "running"
+    assert data["adopted"] is True
+    assert data["run_id"]
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, data["task_id"])
+        assert task is not None
+        assert task.status == "running"
+        assert task.session_id == "desktop-session-1"
+        assert task.current_run_id == data["run_id"]
+        assert task.claim_lock == "session:desktop-session-1"
+    finally:
+        conn.close()
+
+
+def test_create_rejects_session_adoption_without_session_identity(
+    monkeypatch, worker_env,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_create({
+        "title": "cannot adopt",
+        "assignee": "test-worker",
+        "adopt_current_session": True,
+    }))
+
+    assert "requires a trusted interactive session id" in out["error"]
+
+
+def test_create_rejects_session_adoption_for_another_profile(
+    monkeypatch, worker_env,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "desktop-session-1")
+
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_create({
+        "title": "wrong owner",
+        "assignee": "different-profile",
+        "adopt_current_session": True,
+    }))
+
+    assert "must match the active profile" in out["error"]
+
+
+def test_create_schema_exposes_current_session_adoption():
+    from tools import kanban_tools as kt
+
+    prop = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"][
+        "adopt_current_session"
+    ]
+    assert prop["type"] == "boolean"
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

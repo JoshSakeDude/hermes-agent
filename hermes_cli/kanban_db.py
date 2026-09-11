@@ -4734,12 +4734,17 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    from_status: str = "ready",
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Atomically transition an eligible task to ``running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``from_status``). ``from_status='blocked'``
+    is reserved for same-session adoption of a freshly created card; creating
+    it blocked prevents the dispatcher from racing the interactive session.
     """
+    if from_status not in {"ready", "blocked"}:
+        raise ValueError("from_status must be 'ready' or 'blocked'")
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4774,8 +4779,8 @@ def claim_task(
         # it when the CAS resets the pointer below. No-op when the invariant
         # holds (the common case).
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
-            (task_id,),
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = ?",
+            (task_id, from_status),
         ).fetchone()
         if stale and stale["current_run_id"]:
             conn.execute(
@@ -4797,10 +4802,10 @@ def claim_task(
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
+               AND status = ?
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, from_status),
         )
         if cur.rowcount != 1:
             return None
@@ -4835,7 +4840,7 @@ def claim_task(
             (run_id, task_id),
         )
         _append_event(
-            conn, task_id, "claimed",
+            conn, task_id, "adopted" if from_status == "blocked" else "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
@@ -6357,7 +6362,7 @@ def edit_completed_task_result(
     return True
 
 
-def block_task(
+def _block_task_state(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -6582,6 +6587,41 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    return True
+
+
+def block_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Block a task and stop any displaced host-local worker.
+
+    ``_block_task_state`` commits the lifecycle transition first. When an
+    operator blocks a running card from another process, terminate that
+    worker afterward so it cannot keep making side effects or resurrect its
+    own card. A worker blocking itself is left alive long enough to return its
+    tool receipt and exit normally.
+    """
+    active = conn.execute(
+        "SELECT worker_pid, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    ok = _block_task_state(
+        conn,
+        task_id,
+        reason=reason,
+        kind=kind,
+        expected_run_id=expected_run_id,
+    )
+    if not ok or active is None:
+        return ok
+    worker_pid = active["worker_pid"]
+    if worker_pid and int(worker_pid) != os.getpid():
+        _terminate_reclaimed_worker(worker_pid, active["claim_lock"])
     return True
 
 
@@ -9271,6 +9311,8 @@ def _record_task_failure(
     outcome: str,
     failure_limit: int = None,
     force_trip: bool = False,
+    sticky_block_kind: Optional[str] = None,
+    run_summary: Optional[str] = None,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
@@ -9317,17 +9359,43 @@ def _record_task_failure(
     ``detect_crashed_workers``, which resolves the per-task
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
+
+    ``sticky_block_kind`` marks a forced trip as requiring human action. It
+    stores the typed block and appends a final ``blocked`` event so
+    ``recompute_ready`` cannot immediately promote and respawn the unchanged
+    task. Leave it unset for ordinary circuit-breaker failures whose existing
+    retry/recovery semantics must remain unchanged.
+
+    ``run_summary`` persists a worker-generated handoff on the run that is
+    being closed. This is especially important for iteration exhaustion:
+    retries may use a fresh session or workspace, but the next worker still
+    receives the durable run summary through ``kanban_show``.
     """
+    if sticky_block_kind is not None and sticky_block_kind not in VALID_BLOCK_KINDS:
+        raise ValueError(
+            "sticky_block_kind must be one of "
+            f"{sorted(VALID_BLOCK_KINDS)} or None"
+        )
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "block_kind "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        # Terminal sticky finalization is idempotent. A duplicated finalizer
+        # call after the first transaction committed must not increment the
+        # failure counter or append duplicate gave_up/blocked events.
+        if (
+            sticky_block_kind is not None
+            and row["status"] == "blocked"
+            and row["block_kind"] == sticky_block_kind
+        ):
+            return True
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -9374,6 +9442,7 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
+                    summary=run_summary,
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -9396,6 +9465,23 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            if sticky_block_kind is not None:
+                conn.execute(
+                    "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                    "WHERE id = ? AND status = 'blocked'",
+                    (sticky_block_kind, task_id),
+                )
+                blocked_payload = {
+                    "reason": error[:500],
+                    "kind": sticky_block_kind,
+                    "source_status": retry_status,
+                    "automatic": True,
+                }
+                if event_payload_extra and "block_cause" in event_payload_extra:
+                    blocked_payload["block_cause"] = event_payload_extra["block_cause"]
+                _append_event(
+                    conn, task_id, "blocked", blocked_payload, run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.
@@ -9420,6 +9506,7 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
+                    summary=run_summary,
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -11094,6 +11181,11 @@ def _default_spawn(
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
     ]
+    # Profile config intentionally outranks environment defaults in the CLI.
+    # Pin the per-card cap as an explicit argument so a profile-level
+    # ``agent.max_turns`` cannot silently replace (for example) 30 with 45.
+    if task.max_iterations is not None:
+        cmd.extend(["--max-turns", str(int(task.max_iterations))])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but

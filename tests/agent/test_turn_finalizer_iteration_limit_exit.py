@@ -190,10 +190,12 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
             "its budget; resize max_iterations or split the task, "
             "then unblock"
         ),
-        outcome="timed_out",
+        outcome="iteration_budget_exhausted",
         release_claim=True,
         end_run=True,
         force_trip=True,
+        sticky_block_kind="needs_input",
+        run_summary="composed report",
         event_payload_extra={
             "budget_used": 60,
             "budget_max": 60,
@@ -276,7 +278,7 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-456"
-    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["outcome"] == "iteration_budget_exhausted"
     assert kwargs["release_claim"] is True
     assert kwargs["end_run"] is True
     assert kwargs["event_payload_extra"]["budget_used"] == 60
@@ -314,7 +316,7 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-789"
-    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["outcome"] == "iteration_budget_exhausted"
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
