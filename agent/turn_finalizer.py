@@ -70,15 +70,32 @@ def _record_kanban_budget_exhausted(
     api_call_count: int,
     max_iterations: int,
     logger: logging.Logger,
+    handoff_summary: str | None = None,
 ) -> None:
-    """Record a terminal ``timed_out`` outcome for a kanban worker that
-    exhausted its iteration budget.
+    """Record sticky iteration exhaustion for one exact dispatcher run.
 
-    This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
-    (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
-    already closed the run this is a no-op — so it is safe to call from
-    multiple exit paths.
+    Missing or malformed run identity fails closed before opening the board.
+    The database CAS then makes duplicate and stale callbacks no-ops.
     """
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        expected_run_id = int(raw_run_id or "")
+    except (TypeError, ValueError):
+        expected_run_id = 0
+    if expected_run_id <= 0:
+        logger.warning(
+            "Cannot record budget exhaustion for Kanban task %s: "
+            "missing or invalid dispatcher run identity",
+            kanban_task,
+        )
+        return
+
+    error = (
+        f"Iteration budget exhausted "
+        f"({api_call_count}/{max_iterations}) — "
+        "task too large for its budget; resize max_iterations "
+        "or split the task, then unblock"
+    )
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
@@ -86,13 +103,8 @@ def _record_kanban_budget_exhausted(
             _kb._record_task_failure(
                 _conn,
                 kanban_task,
-                error=(
-                    f"Iteration budget exhausted "
-                    f"({api_call_count}/{max_iterations}) — "
-                    "task too large for its budget; resize max_iterations "
-                    "or split the task, then unblock"
-                ),
-                outcome="timed_out",
+                error=error,
+                outcome="iteration_budget_exhausted",
                 release_claim=True,
                 end_run=True,
                 # Route iteration-cap exhaustion straight to blocked instead of
@@ -104,10 +116,18 @@ def _record_kanban_budget_exhausted(
                 # reviewer-run guard (a review run is never downgraded to an
                 # implementation retry) and scrubs the reason of secrets/PII.
                 force_trip=True,
+                sticky_block_kind="needs_input",
+                run_summary=handoff_summary or error,
+                expected_run_id=expected_run_id,
                 event_payload_extra={
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
                     "block_cause": "iteration_budget_exhausted",
+                    "reason_code": "iteration_budget_exhausted",
+                    "retryable": False,
+                    "operator_hint": (
+                        "Raise max_iterations or split the task, then unblock it."
+                    ),
                 },
             )
         finally:
@@ -144,6 +164,18 @@ def _record_kanban_token_budget_yielded(
     When the continuation count reaches ``MAX_BUDGET_CONTINUATIONS`` (2),
     ``_finalize_budget_yielded`` blocks the card with ``needs_input``.
     """
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        expected_run_id = int(raw_run_id or "")
+    except (TypeError, ValueError):
+        expected_run_id = 0
+    if expected_run_id <= 0:
+        logger.warning(
+            "Cannot record token-budget yield for Kanban task %s: "
+            "missing or invalid dispatcher run identity",
+            kanban_task,
+        )
+        return
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
@@ -155,6 +187,7 @@ def _record_kanban_token_budget_yielded(
                 billable_tokens=billable_tokens,
                 max_total_tokens=max_total_tokens,
                 checkpoint=checkpoint,
+                expected_run_id=expected_run_id,
             )
         finally:
             try:
@@ -294,7 +327,13 @@ def finalize_turn(
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             _record_kanban_budget_exhausted(
-                _kanban_task, api_call_count, agent.max_iterations, logger,
+                _kanban_task,
+                api_call_count,
+                agent.max_iterations,
+                logger,
+                handoff_summary=(
+                    final_response if isinstance(final_response, str) else None
+                ),
             )
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the
@@ -308,7 +347,13 @@ def finalize_turn(
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             _record_kanban_budget_exhausted(
-                _kanban_task, api_call_count, agent.max_iterations, logger,
+                _kanban_task,
+                api_call_count,
+                agent.max_iterations,
+                logger,
+                handoff_summary=(
+                    final_response if isinstance(final_response, str) else None
+                ),
             )
 
     # Token-budget yield handoff -- cooperative, NOT a failure.

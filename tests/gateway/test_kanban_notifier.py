@@ -1,11 +1,14 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
+    _failure_decision_suffix,
+    _fold_terminal_events,
     _release_singleton_lock,
 )
 from gateway.run import GatewayRunner
@@ -29,6 +32,67 @@ class DisconnectedAdapters(dict):
 
     def get(self, key, default=None):
         return None
+
+
+def _event(kind, *, run_id, payload=None, event_id=1):
+    return SimpleNamespace(
+        id=event_id,
+        kind=kind,
+        run_id=run_id,
+        payload=payload or {},
+    )
+
+
+def test_notifier_folds_gave_up_into_same_run_automatic_block():
+    events = [
+        _event("gave_up", run_id=7, event_id=1),
+        _event("blocked", run_id=7, payload={"automatic": True}, event_id=2),
+    ]
+    assert [event.kind for event in _fold_terminal_events(events)] == ["blocked"]
+
+
+def test_notifier_never_groups_null_run_events():
+    events = [
+        _event("gave_up", run_id=None, event_id=1),
+        _event("blocked", run_id=None, payload={"automatic": True}, event_id=2),
+    ]
+    assert _fold_terminal_events(events) == events
+
+
+def test_notifier_preserves_distinct_retry_runs():
+    events = [
+        _event("crashed", run_id=10, event_id=1),
+        _event("crashed", run_id=11, event_id=2),
+    ]
+    assert _fold_terminal_events(events) == events
+
+
+def test_notifier_suppresses_weaker_same_run_crash_after_completion():
+    events = [
+        _event("crashed", run_id=12, event_id=1),
+        _event("completed", run_id=12, event_id=2),
+    ]
+    assert [event.kind for event in _fold_terminal_events(events)] == ["completed"]
+
+
+def test_notifier_suppresses_weaker_same_run_timeout_after_give_up():
+    events = [
+        _event("timed_out", run_id=13, event_id=1),
+        _event("gave_up", run_id=13, payload={"retryable": False}, event_id=2),
+    ]
+    assert [event.kind for event in _fold_terminal_events(events)] == ["gave_up"]
+
+
+def test_failure_wording_uses_only_persisted_decision_and_sanitizes_hint():
+    assert _failure_decision_suffix({}) == ""
+    assert "retry scheduled" in _failure_decision_suffix({"retryable": True})
+    rendered = _failure_decision_suffix({
+        "retryable": False,
+        "operator_hint": "check token=super-secret-value at /home/josh/private.log",
+    })
+    assert "no retry" in rendered
+    assert "super-secret-value" not in rendered
+    assert "/home/josh" not in rendered
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
@@ -79,6 +143,53 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+def test_same_run_fold_sends_once_and_advances_past_every_claimed_event(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "folded.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="folded failure", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
+        kb.recompute_ready(conn, failure_limit=3)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                tid,
+                "gave_up",
+                {"error": "invalid worker command", "retryable": False},
+                run_id=claimed.current_run_id,
+            )
+            kb._append_event(
+                conn,
+                tid,
+                "blocked",
+                {
+                    "automatic": True,
+                    "reason": "invalid worker command",
+                    "retryable": False,
+                    "operator_hint": "Check worker launch arguments.",
+                },
+                run_id=claimed.current_run_id,
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "blocked" in adapter.sent[0]["text"]
+    assert "no retry" in adapter.sent[0]["text"]
+    assert _unseen_terminal_events(tid) == []
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):

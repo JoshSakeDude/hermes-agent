@@ -4444,6 +4444,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4460,8 +4461,14 @@ def _end_run(
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
-    run_id = int(row["current_run_id"])
-    conn.execute(
+    run_id = (
+        int(expected_run_id)
+        if expected_run_id is not None
+        else int(row["current_run_id"])
+    )
+    if int(row["current_run_id"]) != run_id:
+        return None
+    closed = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -4474,6 +4481,7 @@ def _end_run(
                claim_expires = NULL,
                worker_pid    = NULL
          WHERE id = ?
+           AND task_id = ?
            AND ended_at IS NULL
         """,
         (
@@ -4484,10 +4492,15 @@ def _end_run(
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
             run_id,
+            task_id,
         ),
     )
+    if closed.rowcount != 1:
+        return None
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE tasks SET current_run_id = NULL "
+        "WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
     )
     return run_id
 
@@ -5607,6 +5620,7 @@ def complete_task(
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
@@ -6442,6 +6456,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6500,6 +6515,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6554,6 +6570,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -6738,6 +6755,7 @@ def request_review(
             status="review",
             summary=summary,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
@@ -6866,6 +6884,7 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            expected_run_id=current_run_id,
         )
         _append_event(
             conn,
@@ -9271,6 +9290,9 @@ def _record_task_failure(
     outcome: str,
     failure_limit: int = None,
     force_trip: bool = False,
+    sticky_block_kind: Optional[str] = None,
+    run_summary: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
@@ -9318,6 +9340,16 @@ def _record_task_failure(
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
     """
+    error = str(redact_review_value(error or "worker failure"))
+    if run_summary is not None:
+        run_summary = str(redact_review_value(run_summary))
+    safe_extra = redact_review_value(event_payload_extra or {})
+    event_payload_extra = safe_extra if isinstance(safe_extra, dict) else {}
+    if sticky_block_kind is not None and sticky_block_kind not in VALID_BLOCK_KINDS:
+        raise ValueError(
+            "sticky_block_kind must be one of "
+            f"{sorted(VALID_BLOCK_KINDS)} or None"
+        )
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
@@ -9328,6 +9360,19 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        if (
+            expected_run_id is not None
+            and row["current_run_id"] != int(expected_run_id)
+        ):
+            return False
+        if expected_run_id is not None and end_run:
+            active_run = conn.execute(
+                "SELECT 1 FROM task_runs "
+                "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if active_run is None:
+                return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -9368,12 +9413,16 @@ def _record_task_failure(
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
                     (failures, error[:500], task_id),
                 )
+            # Once the breaker trips, the effective terminal decision is
+            # no-retry until an operator unblocks the task.
+            terminal_extra = {**event_payload_extra, "retryable": False}
             run_id = None
             if end_run:
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
+                    summary=run_summary,
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -9381,8 +9430,12 @@ def _record_task_failure(
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
                         "retry_status": retry_status,
+                        **terminal_extra,
                     },
+                    expected_run_id=expected_run_id,
                 )
+                if run_id is None:
+                    return False
             payload = {
                 "failures": failures,
                 "effective_limit": effective_limit,
@@ -9391,11 +9444,26 @@ def _record_task_failure(
                 "trigger_outcome": outcome,
                 "retry_status": retry_status,
             }
-            if event_payload_extra:
-                payload.update(event_payload_extra)
+            payload.update(terminal_extra)
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            if sticky_block_kind is not None:
+                conn.execute(
+                    "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                    "WHERE id = ? AND status = 'blocked'",
+                    (sticky_block_kind, task_id),
+                )
+                blocked_payload = {
+                    "reason": error[:500],
+                    "kind": sticky_block_kind,
+                    "source_status": retry_status,
+                    "automatic": True,
+                    **terminal_extra,
+                }
+                _append_event(
+                    conn, task_id, "blocked", blocked_payload, run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.
@@ -9420,12 +9488,17 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
+                    summary=run_summary,
                     error=error[:500],
                     metadata={
                         "failures": failures,
                         "retry_status": retry_status,
+                        **event_payload_extra,
                     },
+                    expected_run_id=expected_run_id,
                 )
+                if run_id is None:
+                    return False
                 _append_event(
                     conn, task_id, outcome,
                     {
@@ -9439,6 +9512,44 @@ def _record_task_failure(
     return blocked
 
 
+def _classify_startup_failure(exc: BaseException) -> dict:
+    """Return the narrow persisted retry decision for a launch failure."""
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    text = "\n".join(str(item) for item in chain)
+    if (
+        any(isinstance(item, FileNotFoundError) for item in chain)
+        or "`hermes` executable not found on PATH" in text
+    ):
+        return {
+            "reason_code": "worker_executable_not_found",
+            "retryable": False,
+            "operator_hint": "Check the Hermes executable path and installation.",
+        }
+
+    if "argument command: invalid choice: '35'" in text:
+        return {
+            "reason_code": "worker_cli_invalid_max_turns_35",
+            "retryable": False,
+            "operator_hint": "Check worker launch argument ordering.",
+        }
+    if re.fullmatch(r"Profile '[^'\r\n]+' does not exist", text.strip()):
+        return {
+            "reason_code": "worker_profile_not_found",
+            "retryable": False,
+            "operator_hint": "Assign an installed Hermes profile.",
+        }
+    return {
+        "reason_code": "worker_startup_unknown",
+        "retryable": True,
+        "operator_hint": "Inspect the current worker run log.",
+    }
+
+
 # Backward-compat alias. Old name is referenced from tests and possibly
 # third-party callers. New code should call ``_record_task_failure``.
 def _record_spawn_failure(
@@ -9447,13 +9558,22 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    expected_run_id: Optional[int] = None,
+    classification: Optional[dict] = None,
 ) -> bool:
+    decision = dict(classification or _classify_startup_failure(RuntimeError(error)))
+    retryable = bool(decision.get("retryable", True))
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
         failure_limit=failure_limit,
+        force_trip=not retryable,
+        sticky_block_kind="needs_input" if not retryable else None,
+        run_summary=decision.get("operator_hint"),
+        expected_run_id=expected_run_id,
         release_claim=True,
         end_run=True,
+        event_payload_extra=decision,
     )
 
 
@@ -9467,6 +9587,7 @@ def _finalize_budget_yielded(
     max_total_tokens=0,
     progress_marker=None,
     checkpoint=None,
+    expected_run_id: Optional[int] = None,
 ):
     """Handle a token-budget yield: end the current run with outcome
     ``budget_yielded``, release the claim, increment the continuation
@@ -9492,6 +9613,11 @@ def _finalize_budget_yielded(
         if task_row["current_run_id"] is None:
             # Idempotent receipt: a duplicate finalizer cannot consume another
             # continuation or change a card that the first receipt already moved.
+            return str(task_row["status"])
+        if (
+            expected_run_id is not None
+            and int(task_row["current_run_id"]) != int(expected_run_id)
+        ):
             return str(task_row["status"])
 
         checkpoint = dict(checkpoint or {})
@@ -9520,6 +9646,7 @@ def _finalize_budget_yielded(
                 'changed_files': checkpoint.get('changed_files') or [],
                 'test_evidence': checkpoint.get('test_evidence'),
             },
+            expected_run_id=expected_run_id,
         )
         if closed_run_id is None:
             return str(task_row["status"])
@@ -9567,7 +9694,13 @@ def _finalize_budget_yielded(
         return "ready"
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
@@ -9575,17 +9708,32 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     the drawer.
     """
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
         )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
-            )
+        if run_id is None:
+            return False
+        active = conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ? AND t.current_run_id = ? "
+            "AND r.task_id = t.id AND r.ended_at IS NULL",
+            (task_id, run_id),
+        ).fetchone()
+        if active is None:
+            return False
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ? AND current_run_id = ?",
+            (int(pid), task_id, run_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (int(pid), run_id, task_id),
+        )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10465,6 +10613,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -10489,7 +10638,18 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                attached = _set_worker_pid(
+                    conn,
+                    claimed.id,
+                    int(pid),
+                    expected_run_id=claimed.current_run_id,
+                )
+                if not attached:
+                    # The process started after this claim was displaced.
+                    # Kill only the PID returned by this local spawn; this is
+                    # orphan cleanup, not operator-driven worker termination.
+                    _terminate_reclaimed_worker(int(pid), claimed.claim_lock)
+                    continue
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -10517,6 +10677,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -10592,6 +10753,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -10621,7 +10783,18 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                attached = _set_worker_pid(
+                    conn,
+                    claimed.id,
+                    int(pid),
+                    expected_run_id=claimed.current_run_id,
+                )
+                if not attached:
+                    # The process started after this claim was displaced.
+                    # Kill only the PID returned by this local spawn; this is
+                    # orphan cleanup, not operator-driven worker termination.
+                    _terminate_reclaimed_worker(int(pid), claimed.claim_lock)
+                    continue
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -10637,6 +10810,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -11094,6 +11268,11 @@ def _default_spawn(
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
     ]
+    # Profile config outranks the environment bridge during CLI startup.
+    # Keep this global option before ``chat`` so argparse binds the card's
+    # explicit limit instead of interpreting the bare number as a command.
+    if task.max_iterations is not None:
+        cmd.extend(["--max-turns", str(int(task.max_iterations))])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but

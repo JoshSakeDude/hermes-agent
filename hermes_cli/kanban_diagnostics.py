@@ -515,6 +515,66 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_actionable_terminal_reason(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Explain the two hardening-package terminal reasons without guessing."""
+    if _task_field(task, "status") != "blocked":
+        return []
+    ordered_runs = sorted(
+        runs, key=lambda run: int(_task_field(run, "id", 0) or 0)
+    )
+    # Only the latest run can explain the card's current block. Older
+    # matching reasons belong to prior block/unblock cycles.
+    for run in reversed(ordered_runs[-1:]):
+        metadata = _task_field(run, "metadata", None)
+        if not isinstance(metadata, dict):
+            return []
+        reason_code = metadata.get("reason_code")
+        if reason_code not in {
+            "iteration_budget_exhausted",
+            "worker_cli_invalid_max_turns_35",
+        }:
+            continue
+        run_id = _task_field(run, "id", None)
+        if reason_code == "iteration_budget_exhausted":
+            title = "Worker exhausted its iteration budget; no retry"
+            detail = (
+                "The run reached its configured iteration limit and was blocked "
+                "instead of repeating the same work. Raise max_iterations or "
+                "split the task, then unblock it."
+            )
+            label = "Resize or split the task, then unblock"
+        else:
+            title = "Worker launch command was invalid; no retry"
+            detail = (
+                "The exact max-turns parser failure was recognized as "
+                "deterministic. Check worker launch argument ordering before "
+                "unblocking the task."
+            )
+            label = "Check worker launch arguments"
+        return [Diagnostic(
+            kind=reason_code,
+            severity="error",
+            title=title,
+            detail=detail,
+            actions=[DiagnosticAction(
+                kind="comment",
+                label=label,
+                payload={},
+                suggested=True,
+            )],
+            first_seen_at=int(_task_field(run, "ended_at", now) or now),
+            last_seen_at=int(_task_field(run, "ended_at", now) or now),
+            count=1,
+            run_id=int(run_id) if run_id is not None else None,
+            data={
+                "reason_code": reason_code,
+                "retryable": metadata.get("retryable"),
+                "operator_hint": metadata.get("operator_hint"),
+            },
+        )]
+    return []
+
+
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task's unified ``consecutive_failures`` counter is climbing —
     something about this task+profile combo is broken and each retry
@@ -1084,6 +1144,7 @@ _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
+    _rule_actionable_terminal_reason,
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,
@@ -1099,6 +1160,8 @@ DIAGNOSTIC_KINDS = (
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
+    "iteration_budget_exhausted",
+    "worker_cli_invalid_max_turns_35",
     "repeated_failures",
     "repeated_crashes",
     "review_dependency_deadlock",
