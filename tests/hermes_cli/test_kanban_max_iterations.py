@@ -98,6 +98,7 @@ def _capture_spawn_env(monkeypatch, tmp_path, *, max_iterations):
         pid = 4242
 
     def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         return FakeProc()
 
@@ -108,12 +109,29 @@ def _capture_spawn_env(monkeypatch, tmp_path, *, max_iterations):
     kb._default_spawn(
         _make_task(kb, max_iterations=max_iterations), str(workspace),
     )
-    return captured["env"]
+    return captured
 
 
 def test_default_spawn_exports_max_iterations_when_set(monkeypatch, tmp_path):
-    env = _capture_spawn_env(monkeypatch, tmp_path, max_iterations=80)
+    env = _capture_spawn_env(monkeypatch, tmp_path, max_iterations=80)["env"]
     assert env["HERMES_MAX_ITERATIONS"] == "80"
+
+
+def test_default_spawn_passes_task_max_iterations_as_cli_override(
+    monkeypatch, tmp_path,
+):
+    """The task cap must beat the worker profile's agent.max_turns setting.
+
+    ``HermesCLI`` intentionally gives profile config precedence over the
+    HERMES_MAX_ITERATIONS environment bridge, so env-only propagation silently
+    turns a 30-turn card into (for example) a 45-turn worker.  The explicit CLI
+    flag is the documented highest-precedence channel.
+    """
+    captured = _capture_spawn_env(monkeypatch, tmp_path, max_iterations=30)
+    cmd = captured["cmd"]
+    index = cmd.index("--max-turns")
+    assert cmd[index + 1] == "30"
+    assert index < cmd.index("chat")
 
 
 def test_default_spawn_omits_max_iterations_when_unset(monkeypatch, tmp_path):
@@ -125,8 +143,10 @@ def test_default_spawn_omits_max_iterations_when_unset(monkeypatch, tmp_path):
     globally absent.
     """
     monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
-    env = _capture_spawn_env(monkeypatch, tmp_path, max_iterations=None)
+    captured = _capture_spawn_env(monkeypatch, tmp_path, max_iterations=None)
+    env = captured["env"]
     assert "HERMES_MAX_ITERATIONS" not in env
+    assert "--max-turns" not in captured["cmd"]
 
 
 # ---------------------------------------------------------------------------
@@ -150,10 +170,12 @@ def test_iteration_exhaustion_routes_to_blocked_not_ready(kanban_home):
     _record_kanban_budget_exhausted(
         t, api_call_count=45, max_iterations=45,
         logger=logging.getLogger("test"),
+        handoff_summary="Changed approval.py; tests pending; resume in workspace A.",
     )
 
     with kb.connect() as conn:
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "blocked", (
             f"iteration-cap exhaustion should block, got {task.status!r}"
         )
@@ -165,6 +187,79 @@ def test_iteration_exhaustion_routes_to_blocked_not_ready(kanban_home):
         assert payload.get("block_cause") == "iteration_budget_exhausted"
         # Reason must be structured + human-readable, no secrets.
         assert "resize max_iterations" in (task.last_failure_error or "")
+
+        # A max-iteration exhaustion is not transient. It must remain blocked
+        # after the dispatcher's normal promotion pass instead of immediately
+        # respawning the same unchanged card.
+        assert task.block_kind == "needs_input"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+        blocked_events = [e for e in events if e.kind == "blocked"]
+        assert blocked_events
+        assert (blocked_events[-1].payload or {}).get("kind") == "needs_input"
+        assert payload.get("trigger_outcome") == "iteration_budget_exhausted"
+        run = conn.execute(
+            "SELECT outcome, summary FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert run["outcome"] == "gave_up"
+        assert run["summary"] == (
+            "Changed approval.py; tests pending; resume in workspace A."
+        )
+
+    with kb.connect() as conn:
+        assert kb.recompute_ready(conn) == 0
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "blocked"
+
+    # A duplicated finalizer callback for the same closed run is a no-op.
+    _record_kanban_budget_exhausted(
+        t, api_call_count=45, max_iterations=45,
+        logger=logging.getLogger("test"),
+        handoff_summary="duplicate callback",
+    )
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.consecutive_failures == 1
+        events = kb.list_events(conn, t)
+        assert len([e for e in events if e.kind == "gave_up"]) == 1
+        assert len([e for e in events if e.kind == "blocked"]) == 1
+
+
+def test_iteration_exhaustion_replaces_historical_block_cause(kanban_home):
+    """A prior capability block must not mask a later iteration exhaustion."""
+    from agent.turn_finalizer import _record_kanban_budget_exhausted
+    import logging
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="retry incident", assignee="gohanlite")
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:first") is not None
+        assert kb.block_task(
+            conn, task_id, reason="old access issue", kind="capability",
+        )
+        assert kb.unblock_task(conn, task_id)
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:second") is not None
+
+    _record_kanban_budget_exhausted(
+        task_id, api_call_count=30, max_iterations=30,
+        logger=logging.getLogger("test"),
+        handoff_summary="partial implementation survives",
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        blocked = [e for e in kb.list_events(conn, task_id) if e.kind == "blocked"]
+        assert (blocked[-1].payload or {}).get("block_cause") == (
+            "iteration_budget_exhausted"
+        )
 
 
 # ---------------------------------------------------------------------------

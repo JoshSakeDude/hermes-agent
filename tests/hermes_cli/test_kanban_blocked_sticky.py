@@ -30,11 +30,13 @@ landed via #28754 / #28781 ahead of this fix.
 from __future__ import annotations
 
 import time
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban as kanban_cli
 
 
 @pytest.fixture
@@ -76,6 +78,55 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+
+
+def test_operator_block_terminates_displaced_worker(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Externally blocking a live card stops the worker after state commits."""
+    captured = {}
+
+    def fake_terminate(pid, claim_lock):
+        captured.update(pid=pid, claim_lock=claim_lock)
+        return {"termination_attempted": True, "terminated": True}
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="operator interrupt")
+        host = kb._claimer_id().split(":", 1)[0]
+        task = kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        assert task is not None
+        conn.execute("UPDATE tasks SET worker_pid = 987654 WHERE id = ?", (tid,))
+        conn.commit()
+        assert kb.block_task(
+            conn, tid, reason="operator stopped work", kind="needs_input",
+        )
+        blocked_task = kb.get_task(conn, tid)
+        assert blocked_task is not None
+        assert blocked_task.status == "blocked"
+
+    assert captured["pid"] == 987654
+    assert captured["claim_lock"]
+
+
+def test_worker_cli_cannot_unblock_its_own_stopped_card(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale worker cannot use the CLI to resurrect an operator-stopped card."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="must stay stopped")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="stop", kind="needs_input")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    args = Namespace(task_ids=[tid], reason="work done")
+    assert kanban_cli._cmd_unblock(args) == 1
+
+    with kb.connect() as conn:
+        blocked_task = kb.get_task(conn, tid)
+        assert blocked_task is not None
+        assert blocked_task.status == "blocked"
+        assert kb.list_comments(conn, tid) == []
 
 
 # ---------------------------------------------------------------------------

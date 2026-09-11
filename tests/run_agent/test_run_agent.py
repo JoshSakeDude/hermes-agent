@@ -4615,7 +4615,7 @@ class TestRunConversation:
         (issue #23216 / #29747 gap 2).
 
         As of #29747, the exhaustion path routes through
-        ``kanban_db._record_task_failure(outcome="timed_out")`` so the
+        ``kanban_db._record_task_failure(outcome="iteration_budget_exhausted")`` so the
         ``consecutive_failures`` counter increments and the dispatcher's
         ``failure_limit`` breaker eventually trips. The legacy
         ``kanban_block`` call was replaced because blocked-outcome runs
@@ -4657,7 +4657,7 @@ class TestRunConversation:
         assert result["completed"] is False
 
         # _record_task_failure should have been called exactly once for
-        # the exhaustion event, with outcome="timed_out".
+        # the exhaustion event, with an explicit causal outcome.
         assert mock_record_failure.call_count == 1, (
             f"Expected exactly 1 _record_task_failure call, "
             f"got {mock_record_failure.call_count}. "
@@ -4666,7 +4666,7 @@ class TestRunConversation:
         call = mock_record_failure.call_args_list[0]
         # Positional: (conn, task_id, ...)
         assert call.args[1] == "t_test_task_123"
-        assert call.kwargs.get("outcome") == "timed_out"
+        assert call.kwargs.get("outcome") == "iteration_budget_exhausted"
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")

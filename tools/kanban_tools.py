@@ -1396,6 +1396,10 @@ def _handle_create(args: dict, **kw) -> str:
         or _current_origin_session_id()
         or os.environ.get("HERMES_SESSION_ID")
     )
+    trusted_session_id = (
+        _current_origin_session_id()
+        or os.environ.get("HERMES_SESSION_ID")
+    )
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1415,6 +1419,31 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
+    adopt_current_session, bool_error = _parse_bool_arg(
+        args, "adopt_current_session"
+    )
+    if bool_error:
+        return tool_error(bool_error)
+    if adopt_current_session:
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return tool_error(
+                "adopt_current_session is only available to an interactive "
+                "orchestrator, not a dispatcher-owned task worker"
+            )
+        if not trusted_session_id:
+            return tool_error(
+                "adopt_current_session requires a trusted interactive session id"
+            )
+        active_profile = os.environ.get("HERMES_PROFILE") or "default"
+        if str(assignee) != active_profile:
+            return tool_error(
+                "adopt_current_session assignee must match the active profile "
+                f"({active_profile})"
+            )
+        if parents:
+            return tool_error(
+                "adopt_current_session cannot be used with parent-gated tasks"
+            )
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -1492,10 +1521,36 @@ def _handle_create(args: dict, **kw) -> str:
                     Decimal(str(max_estimated_cost_usd))
                     if max_estimated_cost_usd is not None else None
                 ),
-                initial_status=str(initial_status),
+                # A card adopted by this chat starts blocked so the dispatcher
+                # cannot claim it between creation and the explicit session
+                # claim immediately below.
+                initial_status=(
+                    "blocked" if adopt_current_session else str(initial_status)
+                ),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+            adopted = False
+            run_id = None
+            if adopt_current_session:
+                cfg = load_config()
+                stale_timeout = int(cfg_get(
+                    cfg, "kanban", "dispatch_stale_timeout_seconds", default=14400
+                ) or 14400)
+                claimed = kb.claim_task(
+                    conn,
+                    new_tid,
+                    ttl_seconds=max(stale_timeout, 60),
+                    claimer=f"session:{trusted_session_id}",
+                    from_status="blocked",
+                )
+                if claimed is None:
+                    return tool_error(
+                        "kanban_create could not adopt the new task; it was left "
+                        "blocked so the dispatcher cannot duplicate the work"
+                    )
+                adopted = True
+                run_id = claimed.current_run_id
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1505,6 +1560,8 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                adopted=adopted,
+                run_id=run_id,
             )
         finally:
             conn.close()
@@ -2303,6 +2360,15 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "adopt_current_session": {
+                "type": "boolean",
+                "description": (
+                    "If true, claim the new card for this interactive session "
+                    "instead of leaving it ready for dispatcher pickup. Requires "
+                    "the assignee to match the active profile and cannot be used "
+                    "from a Kanban worker or with parent-gated tasks."
                 ),
             },
             "skills": {
