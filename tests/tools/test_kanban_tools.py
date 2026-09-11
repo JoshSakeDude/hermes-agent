@@ -63,9 +63,13 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
 
 
@@ -146,6 +150,55 @@ def test_complete_happy_path(worker_env):
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "args"),
+    [
+        ("_handle_complete", {"summary": "done"}),
+        ("_handle_block", {"reason": "blocked", "kind": "needs_input"}),
+        ("_handle_request_review", {"summary": "ready for review"}),
+    ],
+)
+def test_worker_lifecycle_mutations_fail_closed_without_run_id(
+    monkeypatch, worker_env, handler_name, args,
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    result = json.loads(getattr(kt, handler_name)(args))
+
+    assert "error" in result
+    assert "HERMES_KANBAN_RUN_ID" in result["error"]
+
+
+def test_worker_lifecycle_mutation_fails_closed_with_malformed_run_id(
+    monkeypatch, worker_env,
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-a-run")
+    result = json.loads(kt._handle_block({"reason": "blocked"}))
+
+    assert "error" in result
+    assert "malformed" in result["error"]
+
+
+def test_worker_lifecycle_mutation_rejects_stale_run_id(
+    monkeypatch, worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
+    result = json.loads(kt._handle_request_review({"summary": "ready"}))
+
+    assert "error" in result
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id is not None
 
 
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):

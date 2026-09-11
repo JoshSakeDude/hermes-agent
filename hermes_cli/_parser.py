@@ -275,6 +275,15 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--max-turns",
+        dest="max_turns",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum tool-calling iterations per conversation turn",
+    )
+    _inherited_flag(
+        parser,
         "--skills",
         "-s",
         action="append",
@@ -524,7 +533,7 @@ def build_top_level_parser():
     chat_parser.add_argument(
         "--max-turns",
         type=int,
-        default=None,
+        default=argparse.SUPPRESS,
         metavar="N",
         help="Maximum tool-calling iterations per conversation turn (default: 500, or agent.max_turns in config)",
     )
