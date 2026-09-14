@@ -476,6 +476,7 @@ def test_create_can_adopt_task_into_current_interactive_session(
     monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     monkeypatch.setenv("HERMES_SESSION_ID", "desktop-session-1")
 
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
     data = json.loads(kt._handle_create({
         "title": "same-session task",
@@ -489,7 +490,7 @@ def test_create_can_adopt_task_into_current_interactive_session(
     assert data["run_id"]
 
     from hermes_cli import kanban_db as kb
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, data["task_id"])
     assert task is not None
     assert task.status == "running"
@@ -526,6 +527,7 @@ def test_create_schema_exposes_resource_budgets_and_session_adoption():
 
 def test_create_accepts_token_and_cost_limits(worker_env):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
     data = json.loads(kt._handle_create({
@@ -535,7 +537,7 @@ def test_create_accepts_token_and_cost_limits(worker_env):
         "max_estimated_cost_usd": 2.5,
     }))
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, data["task_id"])
     assert task is not None
     assert task.max_total_tokens == 12_000

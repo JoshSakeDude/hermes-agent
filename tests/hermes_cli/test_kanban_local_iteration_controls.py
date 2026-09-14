@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 
 
@@ -16,13 +17,13 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb._INITIALIZED_PATHS.clear()
-    kb.init_db()
+    kbc._INITIALIZED_PATHS.clear()
+    kbc.init_db()
     return home
 
 
 def test_card_iteration_budget_round_trips_and_reaches_worker_argv(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="large task",
@@ -40,7 +41,7 @@ def test_card_iteration_budget_round_trips_and_reaches_worker_argv(kanban_home):
 
 
 def test_iteration_exhaustion_is_sticky_and_compare_and_swap_guarded(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="too large", assignee="worker")
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None and claimed.current_run_id is not None
@@ -90,7 +91,7 @@ def test_iteration_exhaustion_is_sticky_and_compare_and_swap_guarded(kanban_home
 
 
 def test_worker_pid_update_rejects_a_stale_run_receipt(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="claimed task", assignee="worker")
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None and claimed.current_run_id is not None
@@ -113,7 +114,7 @@ def test_worker_pid_update_rejects_a_stale_run_receipt(kanban_home):
 
 
 def test_claim_task_rejects_an_unknown_source_status(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="unclaimed task", assignee="worker")
         with pytest.raises(ValueError, match="from_status"):
             kb.claim_task(conn, task_id, from_status="ready' OR 1=1 --")
