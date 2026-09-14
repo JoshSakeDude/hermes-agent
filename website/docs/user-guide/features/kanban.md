@@ -353,6 +353,22 @@ survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
+
+When the underlying work is already complete or obsolete, an operator can
+close the stranded card without rewriting the database or sending it through
+the intake specifier:
+
+```bash
+hermes kanban resolve t_abc --as done --reason "Delivered by the verified replacement" \
+    --replacement t_def
+hermes kanban resolve t_old --as archived --reason "Obsolete duplicate"
+```
+
+`resolve` is operator-only, requires a reason, emits the normal terminal event
+with explicit resolution metadata, and immediately recomputes dependent cards.
+The optional replacement must exist and already be `done` or `archived`.
+Ordinary blocked work is not resolvable; only `triage` cards and goal-completion
+rejections explicitly fenced for manual resolution are eligible.
 :::
 
 ## Enabling tools for a chat profile
@@ -602,7 +618,7 @@ def register(ctx):
 
 ### Goal-mode cards (`--goal`)
 
-By default each worker gets **one shot** at its card — do the work, call `kanban_complete`/`kanban_block`, exit. Pass `--goal` (CLI) or `goal_mode=True` (the `kanban_create` tool / dashboard) to instead run that worker in a **goal loop**, the same Ralph-style engine behind the `/goal` slash command: after every turn an auxiliary judge checks the worker's output against the card's title + body (treated as the acceptance criteria), and if the work isn't done — and the turn budget remains — the worker keeps going **in the same session** until the judge agrees, the worker terminates the task itself, or the budget runs out (which **blocks** the card for human review rather than exiting silently). If the judge rules the goal **unachievable** as written, the card is blocked immediately with the judge's reason — an impossible card is never marked done, and `kanban complete` / `kanban request-review` on such a card are rejected with a pointer to `kanban block` or re-scoping.
+By default each worker gets **one shot** at its card — do the work, call `kanban_complete`/`kanban_block`, exit. Pass `--goal` (CLI) or `goal_mode=True` (the `kanban_create` tool / dashboard) to instead run that worker in a **goal loop**, the same Ralph-style engine behind the `/goal` slash command: after every turn an auxiliary judge checks the worker's output against the card's title + body (treated as the acceptance criteria), and if the work isn't done — and the turn budget remains — the worker keeps going **in the same session** until the judge agrees, the worker terminates the task itself, or the budget runs out (which **blocks** the card for human review rather than exiting silently). If the judge rules the goal **unachievable** as written, the card is blocked immediately with the judge's reason — an impossible card is never marked done. If a dispatcher-owned worker explicitly calls `kanban_complete` and the judge rejects that completion, Hermes fences the same card in non-dispatchable `blocked` state with `manual_resolution_required=true`; this prevents a finished or disputed task from being redispatched as fresh work. An operator then inspects the evidence and either uses `hermes kanban resolve` or deliberately unblocks the same card for one retry. Review handoff rejection remains on the same card and must be corrected before requesting review again.
 
 ```bash
 hermes kanban create "Translate the docs site to French" \
@@ -851,6 +867,7 @@ hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
 hermes kanban claim <id> [--ttl SECONDS]
 hermes kanban comment <id> "<text>" [--author NAME]
+hermes kanban resolve <id> --as done|archived --reason "..." [--replacement <id>]
 
 # Bulk verbs — accept multiple ids:
 hermes kanban complete <id>... [--result "..."]

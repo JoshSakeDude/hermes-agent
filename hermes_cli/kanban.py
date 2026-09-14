@@ -856,11 +856,27 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
 
 
 def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: str,
-                     continue_hint: str) -> Optional[str]:
+                     continue_hint: str, *, fence_run_id: Optional[int] = None) -> Optional[str]:
     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
     None to allow."""
     verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
+    if rejection is not None and fence_run_id is not None:
+        if not kb.fence_goal_rejection(
+            conn,
+            tid,
+            reason=rejection,
+            verdict="blocked" if verdict == "blocked" else "continue",
+            expected_run_id=fence_run_id,
+        ):
+            failure = kb.explain_transition_failure(
+                conn, tid, handoff.replace(" ", "_"), expected_run_id=fence_run_id)
+            return failure["message"]
+        return (
+            f"kanban: goal {handoff} of {tid} rejected by judge and fenced in blocked: "
+            f"{rejection}. Inspect the card, then use `hermes kanban resolve {tid} "
+            "--as done|archived --reason ...`, or unblock the same card for one deliberate retry."
+        )
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
                 f"the goal unachievable — {rejection}. {blocked_hint}")
@@ -887,16 +903,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
+            expected_run_id = _worker_run_id_for(tid)
             gate_err = _goal_gate_error(
                 conn, tid, (summary or args.result or "").strip(), "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
-                "Provide evidence matching the task's acceptance criteria.")
+                "Provide evidence matching the task's acceptance criteria.",
+                fence_run_id=expected_run_id)
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
-            fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+            ok = kb.complete_task(
+                conn, tid, result=args.result, summary=summary, metadata=metadata,
+                expected_run_id=expected_run_id)
+            if not ok:
+                failure = kb.explain_transition_failure(
+                    conn, tid, "complete", expected_run_id=expected_run_id)
+                fail_msg[tid] = failure["message"]
+            return ok
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 
@@ -1053,6 +1076,45 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_resolve(args: argparse.Namespace) -> int:
+    """Administratively close a triage or goal-judge-fenced task."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err(
+            "kanban resolve is operator-only; dispatcher-owned workers cannot "
+            "administratively close their own tasks"
+        )
+    with kbc.connect_closing() as conn:
+        outcome = kb.resolve_task(
+            conn,
+            args.task_id,
+            disposition=args.disposition,
+            reason=args.reason,
+            replacement_task_id=getattr(args, "replacement", None),
+            actor=_profile_author(),
+        )
+    data = _obj_dict(
+        outcome,
+        ("ok", "task_id", "source_status", "status", "reason_code", "detail"),
+    )
+    if getattr(args, "json", False):
+        _print_json(data)
+    elif outcome.ok:
+        replacement = (
+            f" via {args.replacement}" if getattr(args, "replacement", None) else ""
+        )
+        print(
+            f"Resolved {outcome.task_id}: {outcome.source_status} -> "
+            f"{outcome.status}{replacement}"
+        )
+    else:
+        print(
+            f"cannot resolve {outcome.task_id}: reason_code={outcome.reason_code}; "
+            f"current_status={outcome.source_status!r}; {outcome.detail}",
+            file=sys.stderr,
+        )
+    return 0 if outcome.ok else 1
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:
@@ -1256,7 +1318,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
-    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote, "resolve": _cmd_resolve,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
@@ -1280,6 +1342,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
+  `resolve <id>…`       Operator-only closure for stranded/fenced tasks
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign

@@ -22,7 +22,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def test_card_iteration_budget_round_trips_and_reaches_worker_argv(kanban_home):
+def test_card_iteration_budget_round_trips_without_removed_cli_flag(kanban_home):
     with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
@@ -35,9 +35,10 @@ def test_card_iteration_budget_round_trips_and_reaches_worker_argv(kanban_home):
     assert task is not None
     assert task.max_iterations == 80
     command = kbd._worker_argv(task, "worker", None)
-    index = command.index("--max-turns")
-    assert command[index + 1] == "80"
-    assert index < command.index("chat")
+    # spawn_worker passes the budget through HERMES_MAX_ITERATIONS.  Do not
+    # also emit the removed global --max-turns CLI option: current Hermes
+    # rejects it before the worker starts (argparse exit 2).
+    assert "--max-turns" not in command
 
 
 def test_iteration_exhaustion_is_sticky_and_compare_and_swap_guarded(kanban_home):

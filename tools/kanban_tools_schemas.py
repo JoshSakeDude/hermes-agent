@@ -442,6 +442,11 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "dispatcher SIGTERMs the worker and re-queues the "
                 "task with outcome='timed_out'."
         )),
+        "max_retries": _prop("integer", (
+                "Per-task consecutive-failure limit. 1 blocks on the first "
+                "failed run (no automatic retry); 2 allows one retry. Omit "
+                "to use the dispatcher default."
+        )),
         "max_iterations": _prop("integer", (
                 "Per-card agent-turn budget. Overrides the worker profile's "
                 "max_turns setting; omit to inherit the normal default."

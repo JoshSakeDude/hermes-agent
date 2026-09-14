@@ -229,9 +229,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
+        goal_task = kb.get_task(conn, goal_task_id)
+        assert goal_task is not None
+        goal_run_id = goal_task.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(goal_run_id))
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -249,13 +253,22 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     assert "error" in d
     assert "Goal completion rejected by judge" in d["error"]
     assert "missing verification evidence" in d["error"]
-    assert f"parents=[{goal_task_id}]" in d["error"]
+    assert f"kanban resolve {goal_task_id}" in d["error"]
 
-    # Verify the task is NOT completed in the DB
+    # A rejected completion is fenced for operator resolution rather than
+    # left dispatchable for duplicate execution.
     conn2 = kbc.connect()
     try:
         task = kb.get_task(conn2, goal_task_id)
-        assert task.status == "running"  # Should still be running, not done
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert task.current_run_id is None
+        event = kb.list_events(conn2, goal_task_id)[-1]
+        assert event.kind == "blocked"
+        assert event.payload is not None
+        assert event.payload["manual_resolution_required"] is True
+        assert event.payload["retryable"] is False
     finally:
         conn2.close()
 
@@ -520,12 +533,13 @@ def test_create_schema_exposes_resource_budgets_and_session_adoption():
 
     properties = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
     assert properties["max_iterations"]["type"] == "integer"
+    assert properties["max_retries"]["type"] == "integer"
     assert properties["max_total_tokens"]["type"] == "integer"
     assert properties["max_estimated_cost_usd"]["type"] == "number"
     assert properties["adopt_current_session"]["type"] == "boolean"
 
 
-def test_create_accepts_token_and_cost_limits(worker_env):
+def test_create_accepts_retry_token_and_cost_limits(worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
@@ -533,6 +547,7 @@ def test_create_accepts_token_and_cost_limits(worker_env):
     data = json.loads(kt._handle_create({
         "title": "bounded child",
         "assignee": "test-worker",
+        "max_retries": 1,
         "max_total_tokens": 12_000,
         "max_estimated_cost_usd": 2.5,
     }))
@@ -540,6 +555,7 @@ def test_create_accepts_token_and_cost_limits(worker_env):
     with kbc.connect() as conn:
         task = kb.get_task(conn, data["task_id"])
     assert task is not None
+    assert task.max_retries == 1
     assert task.max_total_tokens == 12_000
     assert str(task.max_estimated_cost_usd) == "2.5"
 

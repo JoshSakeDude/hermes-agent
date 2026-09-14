@@ -2275,8 +2275,10 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     # model at a different depth.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    if task.max_iterations is not None:
-        cmd.extend(["--max-turns", str(task.max_iterations)])
+    # Per-card turn limits are injected as HERMES_MAX_ITERATIONS by
+    # spawn_worker().  Do not duplicate them as a CLI option: --max-turns is
+    # no longer a global Hermes argument and makes the worker exit in argparse
+    # before its Kanban session starts.
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

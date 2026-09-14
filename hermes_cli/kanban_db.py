@@ -861,6 +861,18 @@ class Event:
         )
 
 
+@dataclass(frozen=True)
+class ResolveOutcome:
+    """Result of an explicit operator resolution of a stranded task."""
+
+    ok: bool
+    task_id: str
+    source_status: Optional[str]
+    status: Optional[str]
+    reason_code: Optional[str] = None
+    detail: Optional[str] = None
+
+
 # --- Schema ---
 
 SCHEMA_SQL = """
@@ -3028,6 +3040,149 @@ def block_task(
     return True
 
 
+def fence_goal_rejection(
+    conn: sqlite3.Connection, task_id: str, *, reason: str, verdict: str,
+    expected_run_id: int,
+) -> bool:
+    """Fence a dispatcher-owned goal task after its completion judge rejects.
+
+    This is deliberately separate from :func:`block_task`: a judge rejection is
+    not an ordinary retryable worker block and must never increment or trip the
+    unblock-loop counter.  The run-id compare-and-swap prevents a stale worker
+    from fencing a newer attempt.
+    """
+    reason = str(reason).strip()
+    if not reason:
+        raise ValueError("goal rejection reason is required")
+    if verdict not in {"continue", "blocked"}:
+        raise ValueError("goal rejection verdict must be 'continue' or 'blocked'")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        source_status = str(row["status"])
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'blocked',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   block_kind    = 'needs_input',
+                   last_failure_error = ?
+             WHERE id = ?
+               AND status IN ('running', 'ready', 'review')
+               AND current_run_id = ?
+            """,
+            (reason[:2000], task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_or_synthesize_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
+            summary=reason,
+            synthesize=False,
+        )
+        payload = {
+            "reason": reason,
+            "kind": "needs_input",
+            "source_status": source_status,
+            "cause": "goal_completion_rejected",
+            "verdict": verdict,
+            "manual_resolution_required": True,
+            "retryable": False,
+        }
+        _append_event(conn, task_id, "blocked", payload, run_id=run_id)
+        blocked_task = get_task(conn, task_id)
+    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    return True
+
+
+_TRANSITION_ALLOWED_FROM = {
+    "complete": ("running", "ready", "blocked", "review"),
+    "block": ("running", "ready"),
+    "request_review": ("running", "ready"),
+    "unblock": ("blocked", "scheduled"),
+    "promote": ("todo", "blocked"),
+}
+
+
+def _manual_resolution_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(row and _json_dict(row["payload"]).get("manual_resolution_required"))
+
+
+def explain_transition_failure(
+    conn: sqlite3.Connection, task_id: str, requested_transition: str, *,
+    expected_run_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return a stable, actionable diagnosis after a lifecycle CAS fails."""
+    allowed_from = list(_TRANSITION_ALLOWED_FROM.get(requested_transition, ()))
+    task = get_task(conn, task_id)
+    base: dict[str, Any] = {
+        "task_id": task_id,
+        "requested_transition": requested_transition,
+        "current_status": task.status if task else None,
+        "current_run_id": task.current_run_id if task else None,
+        "allowed_from": allowed_from,
+        "reason_code": "transition_conflict",
+        "recovery_actions": [f"hermes kanban show {task_id} --json"],
+    }
+    if task is None:
+        base.update(
+            reason_code="task_not_found",
+            recovery_actions=["verify the task id and active board"],
+        )
+    elif expected_run_id is not None and task.current_run_id != int(expected_run_id):
+        base.update(
+            reason_code="stale_run_id",
+            recovery_actions=[
+                f"hermes kanban show {task_id} --json",
+                "stop this stale worker; do not retry the mutation",
+            ],
+        )
+    elif allowed_from and task.status not in allowed_from:
+        actions = [f"hermes kanban show {task_id} --json"]
+        if task.status == "triage":
+            actions.append(
+                f"hermes kanban resolve {task_id} --as done|archived --reason <reason>"
+            )
+        elif task.status in {"done", "archived"}:
+            actions.append("no mutation is needed; the task is already terminal")
+        base.update(reason_code="source_status_not_allowed", recovery_actions=actions)
+    elif requested_transition in {"complete", "request_review"} and not _parents_satisfied(conn, task_id):
+        base.update(
+            reason_code="parent_dependencies_unsatisfied",
+            recovery_actions=[
+                f"hermes kanban show {task_id} --json",
+                "complete/archive the required parent or unlink an obsolete dependency",
+            ],
+        )
+    elif task.last_failure_error:
+        base.update(
+            reason_code="acceptance_or_transition_guard_failed",
+            recovery_actions=[
+                f"hermes kanban show {task_id} --json",
+                "address last_failure_error before retrying",
+            ],
+        )
+    base["message"] = (
+        f"cannot {requested_transition} {task_id}: reason_code={base['reason_code']}; "
+        f"current_status={base['current_status']!r}; allowed_from={allowed_from}; "
+        f"recovery_actions={base['recovery_actions']}"
+    )
+    return base
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int,
@@ -3632,6 +3787,136 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
     return True
+
+
+def resolve_task(
+    conn: sqlite3.Connection, task_id: str, *, disposition: str, reason: str,
+    actor: str, replacement_task_id: Optional[str] = None,
+) -> ResolveOutcome:
+    """Operator-only kernel path for a task stranded in triage/judge fencing.
+
+    The CLI owns the operator boundary.  The kernel remains strict about the
+    source state: ordinary blocked work cannot be bypassed, while a block whose
+    latest event explicitly requires manual resolution can be closed.  The
+    terminal state is committed with its audit event in one transaction, then
+    dependents are recomputed.
+    """
+    if disposition not in {"done", "archived"}:
+        raise ValueError("disposition must be 'done' or 'archived'")
+    reason = str(reason).strip()
+    actor = str(actor).strip()
+    if not reason:
+        raise ValueError("resolution reason is required")
+    if not actor:
+        raise ValueError("resolution actor is required")
+    if replacement_task_id == task_id:
+        return ResolveOutcome(
+            False, task_id, None, None, "replacement_is_self",
+            "a task cannot be its own replacement",
+        )
+
+    now = int(time.time())
+    run_id: Optional[int] = None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return ResolveOutcome(
+                False, task_id, None, None, "task_not_found", "task does not exist",
+            )
+        source_status = str(row["status"])
+        resolvable = source_status == "triage" or (
+            source_status == "blocked" and _manual_resolution_block(conn, task_id)
+        )
+        if not resolvable:
+            return ResolveOutcome(
+                False, task_id, source_status, source_status,
+                "source_status_not_resolvable",
+                "only triage tasks and judge-fenced blocked tasks can be resolved",
+            )
+        if replacement_task_id:
+            replacement = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (replacement_task_id,),
+            ).fetchone()
+            if replacement is None:
+                return ResolveOutcome(
+                    False, task_id, source_status, source_status,
+                    "replacement_not_found", "replacement task does not exist",
+                )
+            if replacement["status"] not in {"done", "archived"}:
+                return ResolveOutcome(
+                    False, task_id, source_status, source_status,
+                    "replacement_not_terminal",
+                    f"replacement is {replacement['status']!r}, not done/archived",
+                )
+
+        if disposition == "done":
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'done', result = COALESCE(result, ?), completed_at = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                       block_kind = NULL, block_recurrences = 0,
+                       budget_continuation_count = 0
+                 WHERE id = ? AND status = ?
+                """,
+                (reason, now, task_id, source_status),
+            )
+            event_kind = "completed"
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'archived', claim_lock = NULL,
+                       claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND status = ?
+                """,
+                (task_id, source_status),
+            )
+            event_kind = "archived"
+        if cur.rowcount != 1:
+            return ResolveOutcome(
+                False, task_id, source_status, source_status,
+                "transition_conflict", "task status changed during resolution",
+            )
+        if disposition == "done":
+            run_id = _end_or_synthesize_run(
+                conn,
+                task_id,
+                outcome="completed",
+                status="done",
+                summary=reason,
+                metadata={
+                    "operator_resolution": True,
+                    "actor": actor,
+                    "replacement_task_id": replacement_task_id,
+                },
+                synthesize=True,
+            )
+        else:
+            run_id = _end_run(
+                conn, task_id, outcome="reclaimed", status="reclaimed",
+                summary="task archived by operator resolution",
+            )
+        payload = {
+            "operator_resolution": True,
+            "source_status": source_status,
+            "disposition": disposition,
+            "reason": reason,
+            "actor": actor,
+            "replacement_task_id": replacement_task_id,
+        }
+        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+
+    if disposition == "done":
+        _clear_failure_counter(conn, task_id)
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    resolved = get_task(conn, task_id)
+    if disposition == "done":
+        _fire_task_hook("kanban_task_completed", resolved, task_id, run_id, summary=reason)
+    return ResolveOutcome(True, task_id, source_status, disposition)
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:

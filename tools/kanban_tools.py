@@ -108,7 +108,17 @@ class _Reject(Exception):
     """Carries a finished ``tool_error`` payload out of a validation helper."""
 
     def __init__(self, message: str):
+        self.message = message
         super().__init__(tool_error(message))
+
+
+class _GoalGateRejected(_Reject):
+    """A reachable goal judge explicitly refused a lifecycle handoff."""
+
+    def __init__(self, message: str, *, verdict: str, reason: str):
+        self.verdict = verdict
+        self.reason = reason
+        super().__init__(message)
 
 
 def _check(cond: Any, message: str) -> None:
@@ -380,9 +390,10 @@ _GOAL_GATE_MESSAGES = {
             "will NOT complete silently. Either re-scope the task with kanban_edit, or record "
             "the block with kanban_block and hand the decision to a human / reviewer."),
         "continue": (
-            "Goal completion rejected by judge: {reason}. To proceed, either: (1) provide "
-            "explicit acceptance evidence in your summary matching the task's criteria, or (2) "
-            "create continuation tasks with parents=[{tid}] and keep this task alive.")},
+            "Goal completion rejected by judge: {reason}. The task is fenced for operator "
+            "resolution to prevent duplicate execution. An operator can inspect the evidence, "
+            "then use `hermes kanban resolve {tid} --as done|archived --reason ...`, or unblock "
+            "the same card for one deliberate retry.")},
     "kanban_request_review": {
         "blocked": (
             "Goal review handoff rejected: judge ruled the goal unachievable — {reason}. "
@@ -409,7 +420,22 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     if verdict == "done":
         return
     key = "blocked" if verdict == "blocked" else "continue"
-    raise _Reject(_GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid))
+    raise _GoalGateRejected(
+        _GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid),
+        verdict=key,
+        reason=reason,
+    )
+
+
+def _transition_tool_error(kb, conn, tid: str, transition: str, *,
+                           expected_run_id: Optional[int], detail: Optional[str] = None) -> str:
+    failure = kb.explain_transition_failure(
+        conn, tid, transition, expected_run_id=expected_run_id)
+    if detail:
+        failure["detail"] = detail
+    failure["ok"] = False
+    failure["error"] = failure["message"] + (f"; detail={detail}" if detail else "")
+    return json.dumps(failure)
 
 
 # --- Runtime-activity → board bridges (auto-heartbeat, live comment injection) ---
@@ -582,11 +608,31 @@ def _handle_complete(args: dict, **kw) -> str:
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        expected_run_id = _worker_run_id(tid)
+        try:
+            _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        except _GoalGateRejected as rejection:
+            if expected_run_id is None:
+                return tool_error(
+                    f"{rejection.message} The rejection could not be fenced safely because "
+                    "this worker has no HERMES_KANBAN_RUN_ID; stop and let an operator inspect "
+                    "the card rather than retrying.")
+            if not kb.fence_goal_rejection(
+                conn,
+                tid,
+                reason=rejection.reason,
+                verdict=rejection.verdict,
+                expected_run_id=expected_run_id,
+            ):
+                return _transition_tool_error(
+                    kb, conn, tid, "complete", expected_run_id=expected_run_id,
+                    detail="goal judge rejected completion, but the stale run could not fence the card",
+                )
+            return tool_error(rejection.message)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=expected_run_id)
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -608,9 +654,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
+        if not ok:
+            task = kb.get_task(conn, tid)
+            return _transition_tool_error(
+                kb, conn, tid, "complete", expected_run_id=expected_run_id,
+                detail=task.last_failure_error if task else None,
+            )
         task = kb.get_task(conn, tid)
-        _check(ok, (task.last_failure_error if task else None) or
-               f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
         return _ok(task_id=tid, run_id=run.id if run else None)
 
@@ -641,8 +691,11 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        expected_run_id = _worker_run_id(tid)
+        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=expected_run_id)
+        if not ok:
+            return _transition_tool_error(
+                kb, conn, tid, "block", expected_run_id=expected_run_id)
         return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
 
 
@@ -901,6 +954,7 @@ def _handle_create(args: dict, **kw) -> str:
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")),
+            max_retries=_opt_int(args.get("max_retries")),
             max_iterations=_opt_int(args.get("max_iterations")),
             max_total_tokens=_opt_int(args.get("max_total_tokens")),
             max_estimated_cost_usd=args.get("max_estimated_cost_usd"), skills=skills,
