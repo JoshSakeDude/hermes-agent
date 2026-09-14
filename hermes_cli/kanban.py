@@ -362,6 +362,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
     max_iterations = getattr(args, "max_iterations", None)
     if max_iterations is not None and max_iterations < 1:
         return _err(f"kanban: --max-iterations must be >= 1 (got {max_iterations})", 2)
+    max_total_tokens = getattr(args, "max_total_tokens", None)
+    if max_total_tokens is not None and max_total_tokens < 1:
+        return _err(
+            f"kanban: --max-total-tokens must be >= 1 (got {max_total_tokens})", 2)
+    max_estimated_cost_usd = getattr(args, "max_estimated_cost_usd", None)
+    if max_estimated_cost_usd is not None and max_estimated_cost_usd <= 0:
+        return _err(
+            "kanban: --max-estimated-cost-usd must be > 0 "
+            f"(got {max_estimated_cost_usd})", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=args.body, assignee=args.assignee,
@@ -372,6 +381,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
             max_retries=max_retries, max_iterations=max_iterations,
+            max_total_tokens=max_total_tokens,
+            max_estimated_cost_usd=max_estimated_cost_usd,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),

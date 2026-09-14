@@ -26,6 +26,20 @@ This is a reporting opportunity, not a guarantee that a model will heed the noti
 Ordinary conversations and delegated children do not inherit the automatic Kanban
 checkpoint; their iteration warning remains opt-in.
 
+### Per-card resource budgets and yielding
+
+Use `--max-total-tokens` to limit uncached input plus output tokens for each
+worker run, and `--max-estimated-cost-usd` to add an optional estimated-cost
+ceiling. The same fields are available through `kanban_create` and the dashboard
+API, and both appear in task JSON.
+
+At 75% Hermes sends one checkpoint warning. At the ceiling, the worker gets two
+finalization turns to finish an atomic operation and record a structured handoff,
+then yields so fresh runnable work can proceed first. Repeated no-progress yields
+or a third continuation block the task for human review. Tasks without either
+field keep the historical unlimited behavior; cache-read tokens remain visible in
+usage accounting but do not consume the per-run ceiling.
+
 ### Two surfaces: the model talks through tools, you talk through the CLI
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
@@ -800,7 +814,7 @@ To disable without removing: add `dashboard.plugins.kanban.enabled: false` to `c
 
 ### Scope boundary
 
-The GUI is deliberately thin. Everything the plugin does is reachable from the CLI; the plugin just makes it comfortable for humans. Auto-assignment, budgets, governance gates, and org-chart views remain user-space — a router profile, another plugin, or a reuse of `tools/approval.py` — exactly as listed in the out-of-scope section of the design spec.
+The GUI is deliberately thin. Everything the plugin does is reachable from the CLI; the plugin just makes it comfortable for humans. Auto-assignment, governance gates, and org-chart views remain user-space — a router profile, another plugin, or a reuse of `tools/approval.py` — exactly as listed in the out-of-scope section of the design spec. Per-card token and estimated-cost ceilings are enforced by the built-in worker lifecycle.
 
 ## CLI command reference
 
@@ -815,6 +829,9 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
                                 [--max-retries N]
+                                [--max-iterations N]
+                                [--max-total-tokens N]
+                                [--max-estimated-cost-usd USD]
                                 [--goal] [--goal-max-turns N]
                                 [--skill <name>]...
                                 [--json]

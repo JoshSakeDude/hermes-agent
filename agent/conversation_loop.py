@@ -1496,6 +1496,15 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    # Dispatcher-owned Kanban workers keep one resource budget across all
+    # turns in this process (including goal-loop continuations).
+    from agent.kanban_budget import budget_from_env
+    agent._token_budget = budget_from_env(getattr(agent, "_token_budget", None))
+    if agent._token_budget is not None:
+        agent._token_budget_warning_pending = getattr(
+            agent, "_token_budget_warning_pending", False
+        )
+        agent._token_budget_exhausted = False
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,

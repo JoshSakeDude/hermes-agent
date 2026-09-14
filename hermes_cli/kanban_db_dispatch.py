@@ -1140,6 +1140,89 @@ def _record_task_failure(
         return True
 
 
+def _finalize_budget_yielded(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    handoff_summary: str,
+    budget_snapshot: dict,
+    checkpoint: Optional[dict] = None,
+) -> Optional[str]:
+    """Close one run as a cooperative yield and requeue or block the card.
+
+    The run-id receipt makes duplicate/stale finalizers no-ops. Budget yields
+    never touch the ordinary failure counter.
+    """
+    from agent.kanban_budget import MAX_BUDGET_CONTINUATIONS
+
+    checkpoint = dict(checkpoint or {})
+    marker = checkpoint.get("progress_marker")
+    safe_snapshot = _kb.redact_review_value(dict(budget_snapshot or {}))
+    safe_checkpoint = _kb.redact_review_value(checkpoint)
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, budget_continuation_count "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != int(expected_run_id)
+        ):
+            return None
+        active = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if active is None:
+            return None
+
+        prior = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? "
+            "AND outcome = 'budget_yielded' AND ended_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        prior_marker = _kb._json_dict(prior["metadata"]).get("progress_marker") if prior else None
+        continuation_count = int(row["budget_continuation_count"] or 0) + 1
+        no_progress = bool(marker) and marker == prior_marker
+        blocked = no_progress or continuation_count > MAX_BUDGET_CONTINUATIONS
+        metadata = {
+            **(safe_snapshot if isinstance(safe_snapshot, dict) else {}),
+            **(safe_checkpoint if isinstance(safe_checkpoint, dict) else {}),
+            "continuation_count": continuation_count,
+        }
+        run_id = _kb._end_run(
+            conn, task_id, outcome="budget_yielded",
+            status="blocked" if blocked else "released",
+            summary=str(_kb.redact_review_value(handoff_summary or ""))[:500] or None,
+            metadata=metadata, expected_run_id=expected_run_id,
+        )
+        if run_id is None:
+            return None
+        status = "blocked" if blocked else "ready"
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL, budget_continuation_count = ?, "
+            "block_kind = ?, block_recurrences = ? WHERE id = ?",
+            (
+                status, continuation_count, "needs_input" if blocked else None,
+                1 if blocked else 0, task_id,
+            ),
+        )
+        payload = {"continuation_count": continuation_count, "budget": safe_snapshot}
+        if blocked:
+            payload.update(
+                reason="no_progress" if no_progress else "continuation_exhausted",
+                kind="needs_input",
+                operator_hint="Increase the card budget or split the task, then unblock it.",
+            )
+            _kb._append_event(conn, task_id, "budget_yielded_blocked", payload, run_id=run_id)
+        else:
+            _kb._append_event(conn, task_id, "budget_yielded", payload, run_id=run_id)
+        return status
+
+
 def _set_worker_pid(
     conn: sqlite3.Connection, task_id: str, pid: int, *,
     expected_run_id: Optional[int] = None,
@@ -1783,7 +1866,7 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "ORDER BY (budget_continuation_count > 0) ASC, priority DESC, created_at ASC"
     ).fetchall()
 
 
@@ -2314,6 +2397,12 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     if task.max_iterations is not None:
         env["HERMES_MAX_ITERATIONS"] = str(task.max_iterations)
+    if task.max_total_tokens is not None:
+        env["HERMES_KANBAN_MAX_TOTAL_TOKENS"] = str(task.max_total_tokens)
+    if task.max_estimated_cost_usd is not None:
+        env["HERMES_KANBAN_MAX_ESTIMATED_COST_USD"] = str(task.max_estimated_cost_usd)
+    if task.budget_continuation_count:
+        env["HERMES_KANBAN_BUDGET_CONTINUATION_COUNT"] = str(task.budget_continuation_count)
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"

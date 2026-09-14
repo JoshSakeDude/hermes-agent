@@ -477,6 +477,14 @@ def finalize_turn(
         logger=logger,
     )
 
+    if _turn_exit_reason == "resource_budget_yielded":
+        try:
+            from agent.kanban_budget import record_budget_yield
+
+            record_budget_yield(agent, messages, _turn_exit_reason)
+        except Exception as exc:
+            logger.warning("Failed to record Kanban resource-budget yield: %s", exc)
+
     completed = (
         final_response is not None
         and not failed

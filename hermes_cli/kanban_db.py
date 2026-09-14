@@ -23,6 +23,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -708,6 +709,12 @@ class Task:
     max_retries: Optional[int] = None
     # Per-card agent turn cap; None inherits the worker profile/global default.
     max_iterations: Optional[int] = None
+    # Per-run resource ceilings for dispatcher-owned workers. Cached reads stay
+    # visible in accounting but do not consume ``max_total_tokens``.
+    max_total_tokens: Optional[int] = None
+    max_estimated_cost_usd: Optional[Decimal] = None
+    # Cooperative budget yields completed before the current attempt.
+    budget_continuation_count: int = 0
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
     # done / budget exhausted (-> kanban_block); ``goal_max_turns`` None -> goals default.
     goal_mode: bool = False
@@ -734,6 +741,11 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            max_estimated_cost_usd=(
+                Decimal(str(g("max_estimated_cost_usd")))
+                if g("max_estimated_cost_usd") is not None else None
+            ),
+            budget_continuation_count=int(g("budget_continuation_count") or 0),
         )
 
 
@@ -746,7 +758,8 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "max_iterations", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "max_iterations", "max_total_tokens", "session_id",
+    "completion_contract",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -917,6 +930,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_retries          INTEGER,
     -- Per-task agent-turn budget. NULL inherits the worker profile/global cap.
     max_iterations       INTEGER,
+    -- Per-run ceilings for dispatcher-owned workers. NULL preserves the
+    -- historical unbounded behavior. Decimal cost is stored losslessly as text.
+    max_total_tokens     INTEGER,
+    max_estimated_cost_usd TEXT,
+    -- Two cooperative continuations are allowed; a third yield blocks.
+    budget_continuation_count INTEGER NOT NULL DEFAULT 0,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -1230,6 +1249,8 @@ def create_task(
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, max_iterations: Optional[int] = None,
+    max_total_tokens: Optional[int] = None,
+    max_estimated_cost_usd: Optional[Decimal] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
@@ -1266,6 +1287,12 @@ def create_task(
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     if max_iterations is not None and int(max_iterations) < 1:
         raise ValueError("max_iterations must be >= 1")
+    if max_total_tokens is not None and int(max_total_tokens) < 1:
+        raise ValueError("max_total_tokens must be >= 1")
+    if max_estimated_cost_usd is not None:
+        max_estimated_cost_usd = Decimal(str(max_estimated_cost_usd))
+        if max_estimated_cost_usd <= 0:
+            raise ValueError("max_estimated_cost_usd must be > 0")
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1336,10 +1363,11 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, max_iterations, model_override, provider_override,
+                        skills, max_retries, max_iterations, max_total_tokens,
+                        max_estimated_cost_usd, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1347,7 +1375,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
-                        _opt_int(max_retries), _opt_int(max_iterations),
+                        _opt_int(max_retries), _opt_int(max_iterations), _opt_int(max_total_tokens),
+                        str(max_estimated_cost_usd) if max_estimated_cost_usd is not None else None,
                         model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
@@ -2598,7 +2627,8 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       budget_continuation_count = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """

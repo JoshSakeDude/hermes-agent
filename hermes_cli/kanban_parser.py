@@ -9,6 +9,7 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
@@ -183,6 +184,11 @@ _SPECS = [
         _arg("--max-iterations", type=int, metavar="N",
              help="Per-card agent-turn budget. Overrides the worker profile's "
                   "max_turns setting; omit to inherit the normal default."),
+        _arg("--max-total-tokens", type=int, metavar="N",
+             help="Per-card billable-token ceiling. Near the limit the worker "
+                  "checkpoints, then yields without stalling unrelated work."),
+        _arg("--max-estimated-cost-usd", type=Decimal, metavar="USD",
+             help="Optional estimated-cost ceiling in USD."),
         _arg("--model", dest="model_override",
              help="Pin the worker to this model (passed as -m <model>) without "
                   "changing the profile's configured model. Combine with --provider "

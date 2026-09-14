@@ -19,7 +19,8 @@ _TASK_DICT_FIELDS = (
     "id", "title", "body", "assignee", "status", "priority", "tenant",
     "workspace_kind", "workspace_path", "branch_name", "project_id",
     "created_by", "created_at", "started_at", "completed_at", "result",
-    "skills", "max_retries", "max_iterations", "model_override", "provider_override",
+    "skills", "max_retries", "max_iterations", "max_total_tokens",
+    "max_estimated_cost_usd", "budget_continuation_count", "model_override", "provider_override",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
 )
 _SHOW_RUN_FIELDS = (
@@ -85,4 +86,6 @@ def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
     d["skills"] = list(t.skills) if t.skills else []
+    if t.max_estimated_cost_usd is not None:
+        d["max_estimated_cost_usd"] = str(t.max_estimated_cost_usd)
     return d

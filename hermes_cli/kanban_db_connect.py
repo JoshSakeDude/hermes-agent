@@ -803,6 +803,9 @@ _LATER_TASK_COLUMNS = (
     # ``kanban.failure_limit`` config, then ``DEFAULT_FAILURE_LIMIT``.
     ("max_retries", "max_retries INTEGER"),
     ("max_iterations", "max_iterations INTEGER"),
+    ("max_total_tokens", "max_total_tokens INTEGER"),
+    ("max_estimated_cost_usd", "max_estimated_cost_usd TEXT"),
+    ("budget_continuation_count", "budget_continuation_count INTEGER NOT NULL DEFAULT 0"),
     ("model_override", "model_override TEXT"),
     ("provider_override", "provider_override TEXT"),
     ("reasoning_effort", "reasoning_effort TEXT"),

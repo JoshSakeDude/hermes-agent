@@ -446,6 +446,12 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Per-card agent-turn budget. Overrides the worker profile's "
                 "max_turns setting; omit to inherit the normal default."
         )),
+        "max_total_tokens": _prop("integer", (
+                "Per-card billable-token ceiling. Near the limit the worker "
+                "checkpoints, then yields without stalling unrelated work."
+        )),
+        "max_estimated_cost_usd": _prop(
+            "number", "Optional estimated-cost ceiling in USD."),
         "adopt_current_session": _prop("boolean", (
                 "Claim the new card for this interactive session instead of "
                 "leaving it ready for dispatcher pickup. Requires the assignee "

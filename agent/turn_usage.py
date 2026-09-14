@@ -236,6 +236,23 @@ def record_response_usage(
     agent.session_cost_status = cost_result.status
     agent.session_cost_source = cost_result.source
 
+    from agent.kanban_budget import accrue_usage
+    _warned, _finalizing = accrue_usage(
+        agent, canonical_usage, estimated_cost_usd=_cost_delta,
+    )
+    _budget = getattr(agent, "_token_budget", None)
+    if _warned and _budget is not None and not agent.quiet_mode:
+        agent._safe_print(
+            "\nResource budget 75% used: "
+            f"{_budget.billable_tokens:,} billable tokens, "
+            f"${float(_budget.estimated_cost_usd or 0):.4f} estimated."
+        )
+    if _finalizing and _budget is not None and not agent.quiet_mode:
+        agent._safe_print(
+            "\nResource ceiling reached — entering bounded finalization "
+            f"({_budget.finalization_remaining} provider requests)."
+        )
+
     # Persist per-call token deltas for any session_id so non-CLI runs can't lose
     # accounting; gateway/session-store writes use absolute totals and safely overwrite
     # these deltas. Enqueued, not written (a cold state.db UPDATE here stalled the tool

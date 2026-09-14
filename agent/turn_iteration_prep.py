@@ -346,6 +346,17 @@ def begin_iteration(
             )
         return _verdict("break")
 
+    from agent.kanban_budget import prepare_budget_request
+    if not prepare_budget_request(agent, messages):
+        _turn_exit_reason = "resource_budget_yielded"
+        budget = agent._token_budget
+        if not agent.quiet_mode:
+            agent._safe_print(
+                "\nResource budget exhausted — yielding before another provider request "
+                f"({budget.exhausted_dimension})."
+            )
+        return _verdict("break")
+
     api_call_count += 1
     agent._api_call_count = api_call_count
     agent._touch_activity(f"starting API call #{api_call_count}")

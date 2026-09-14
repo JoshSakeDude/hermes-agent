@@ -514,12 +514,32 @@ def test_create_rejects_adoption_without_session_identity(monkeypatch, worker_en
     assert "requires a trusted interactive session id" in data["error"]
 
 
-def test_create_schema_exposes_iteration_budget_and_session_adoption():
+def test_create_schema_exposes_resource_budgets_and_session_adoption():
     from tools import kanban_tools as kt
 
     properties = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
     assert properties["max_iterations"]["type"] == "integer"
+    assert properties["max_total_tokens"]["type"] == "integer"
+    assert properties["max_estimated_cost_usd"]["type"] == "number"
     assert properties["adopt_current_session"]["type"] == "boolean"
+
+
+def test_create_accepts_token_and_cost_limits(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    data = json.loads(kt._handle_create({
+        "title": "bounded child",
+        "assignee": "test-worker",
+        "max_total_tokens": 12_000,
+        "max_estimated_cost_usd": 2.5,
+    }))
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, data["task_id"])
+    assert task is not None
+    assert task.max_total_tokens == 12_000
+    assert str(task.max_estimated_cost_usd) == "2.5"
 
 
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])

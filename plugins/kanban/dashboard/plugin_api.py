@@ -19,6 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import asdict
+from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
@@ -173,6 +174,8 @@ _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) -> dict[str, Any]:
     d = asdict(task)
+    if task.max_estimated_cost_usd is not None:
+        d["max_estimated_cost_usd"] = str(task.max_estimated_cost_usd)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
         d["age"] = kanban_db.task_age(task)
@@ -383,6 +386,8 @@ class CreateTaskBody(BaseModel):
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
     max_iterations: Optional[int] = Field(default=None, ge=1)
+    max_total_tokens: Optional[int] = Field(default=None, ge=1)
+    max_estimated_cost_usd: Optional[Decimal] = Field(default=None, gt=0)
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
