@@ -442,6 +442,16 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "dispatcher SIGTERMs the worker and re-queues the "
                 "task with outcome='timed_out'."
         )),
+        "max_iterations": _prop("integer", (
+                "Per-card agent-turn budget. Overrides the worker profile's "
+                "max_turns setting; omit to inherit the normal default."
+        )),
+        "adopt_current_session": _prop("boolean", (
+                "Claim the new card for this interactive session instead of "
+                "leaving it ready for dispatcher pickup. Requires the assignee "
+                "to match the active profile and cannot be used from a Kanban "
+                "worker or with parent-gated tasks."
+        )),
         "initial_status": {
             "type": "string",
             "enum": ["running", "blocked"],

@@ -860,14 +860,26 @@ def _handle_create(args: dict, **kw) -> str:
     # See #67567. ``project=""`` is an explicit "no project" (no ``or`` collapse, #106342).
     project_id = args["project"] if "project" in args else args.get("project_id")
     project_source_task_id = None
-    triage, skills, goal_mode = (
+    triage, skills, goal_mode, adopt_current_session = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
-        _parse_bool_arg(args, "goal_mode"))
+        _parse_bool_arg(args, "goal_mode"), _parse_bool_arg(args, "adopt_current_session"))
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    from tools.async_delegation import _current_origin_session_id
+    trusted_session_id = _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID")
+    if adopt_current_session:
+        _check(not os.environ.get("HERMES_KANBAN_TASK"),
+               "adopt_current_session is only available to an interactive orchestrator, "
+               "not a dispatcher-owned task worker")
+        _check(trusted_session_id,
+               "adopt_current_session requires a trusted interactive session id")
+        active_profile = os.environ.get("HERMES_PROFILE") or "default"
+        _check(str(assignee) == active_profile,
+               "adopt_current_session assignee must match the active profile "
+               f"({active_profile})")
+        _check(not parents, "adopt_current_session cannot be used with parent-gated tasks")
     with _board(args.get("board")) as (kb, conn):
-        from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                     if _is_dispatcher_owned_worker() else None)
         self_task = kb.get_task(conn, self_tid) if self_tid else None
@@ -888,14 +900,35 @@ def _handle_create(args: dict, **kw) -> str:
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
-            max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+            max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")),
+            max_iterations=_opt_int(args.get("max_iterations")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
-            initial_status=str(args.get("initial_status") or "running"),
+            # Block first so the dispatcher cannot claim between creation and
+            # this session's explicit claim below.
+            initial_status=("blocked" if adopt_current_session
+                            else str(args.get("initial_status") or "running")),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+        adopted = False
+        run_id = None
+        if adopt_current_session:
+            stale_timeout = int(cfg_get(
+                load_config(), "kanban", "dispatch_stale_timeout_seconds", default=14400
+            ) or 14400)
+            claimed = kb.claim_task(
+                conn, new_tid, ttl_seconds=max(stale_timeout, 60),
+                claimer=f"session:{trusted_session_id}", from_status="blocked",
+            )
+            _check(claimed is not None,
+                   "kanban_create could not adopt the new task; it was left blocked "
+                   "so the dispatcher cannot duplicate the work")
+            adopted = True
+            run_id = claimed.current_run_id
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
+        return _ok(
+            task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid),
+            adopted=adopted, run_id=run_id)
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:

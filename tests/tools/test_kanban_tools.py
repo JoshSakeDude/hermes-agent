@@ -469,6 +469,59 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_can_adopt_task_into_current_interactive_session(
+    monkeypatch, worker_env,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "desktop-session-1")
+
+    from tools import kanban_tools as kt
+    data = json.loads(kt._handle_create({
+        "title": "same-session task",
+        "assignee": "test-worker",
+        "adopt_current_session": True,
+    }))
+
+    assert data["ok"] is True
+    assert data["status"] == "running"
+    assert data["adopted"] is True
+    assert data["run_id"]
+
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        task = kb.get_task(conn, data["task_id"])
+    assert task is not None
+    assert task.status == "running"
+    assert task.session_id == "desktop-session-1"
+    assert task.current_run_id == data["run_id"]
+    assert task.claim_lock == "session:desktop-session-1"
+
+
+def test_create_rejects_adoption_without_session_identity(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    from tools import kanban_tools as kt
+    data = json.loads(kt._handle_create({
+        "title": "cannot adopt",
+        "assignee": "test-worker",
+        "adopt_current_session": True,
+    }))
+
+    assert "requires a trusted interactive session id" in data["error"]
+
+
+def test_create_schema_exposes_iteration_budget_and_session_adoption():
+    from tools import kanban_tools as kt
+
+    properties = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert properties["max_iterations"]["type"] == "integer"
+    assert properties["adopt_current_session"]["type"] == "boolean"
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(

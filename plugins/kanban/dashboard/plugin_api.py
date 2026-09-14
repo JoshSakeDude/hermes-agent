@@ -382,6 +382,7 @@ class CreateTaskBody(BaseModel):
     triage: bool = False
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    max_iterations: Optional[int] = Field(default=None, ge=1)
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None

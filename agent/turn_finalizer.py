@@ -40,9 +40,10 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
 
 
 def _record_kanban_budget_exhausted(
-    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
+    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger,
+    handoff_summary: Optional[str] = None,
 ) -> None:
-    """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
+    """Record a sticky terminal outcome for a kanban worker out of budget.
 
     Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
     consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
@@ -52,6 +53,17 @@ def _record_kanban_budget_exhausted(
     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
     from multiple exit paths.
     """
+    try:
+        expected_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
+    except (TypeError, ValueError):
+        expected_run_id = 0
+    if expected_run_id <= 0:
+        logger.warning(
+            "Cannot record budget exhaustion for Kanban task %s: "
+            "missing or invalid dispatcher run identity",
+            kanban_task,
+        )
+        return
     try:
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
@@ -63,12 +75,24 @@ def _record_kanban_budget_exhausted(
                 kanban_task,
                 error=(
                     f"Iteration budget exhausted ({api_call_count}/{max_iterations}) — "
-                    "task could not complete within the allowed iterations"
+                    "task too large for its budget; resize max_iterations or split the task, "
+                    "then unblock"
                 ),
-                outcome="timed_out",
+                outcome="iteration_budget_exhausted",
                 release_claim=True,
                 end_run=True,
-                event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                force_trip=True,
+                sticky_block_kind="needs_input",
+                run_summary=handoff_summary,
+                expected_run_id=expected_run_id,
+                event_payload_extra={
+                    "budget_used": api_call_count,
+                    "budget_max": max_iterations,
+                    "block_cause": "iteration_budget_exhausted",
+                    "reason_code": "iteration_budget_exhausted",
+                    "retryable": False,
+                    "operator_hint": "Raise max_iterations or split the task, then unblock it.",
+                },
             )
         finally:
             with suppress(Exception):
@@ -168,7 +192,10 @@ def _resolve_budget_fallback(
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
     if _kanban_task:
-        _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
+        _record_kanban_budget_exhausted(
+            _kanban_task, api_call_count, agent.max_iterations, logger,
+            handoff_summary=flatten_message_text(final_response).strip() or None,
+        )
     return final_response, _turn_exit_reason, preserved_verification_fallback
 
 

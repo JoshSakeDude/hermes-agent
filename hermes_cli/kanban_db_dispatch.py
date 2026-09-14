@@ -991,32 +991,53 @@ def _record_task_failure(
     outcome: str,
     failure_limit: int = None,
     force_trip: bool = False,
+    sticky_block_kind: Optional[str] = None,
+    run_summary: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
-    """Record a non-success outcome and maybe trip the circuit breaker; every
-    non-success path funnels through here so ``consecutive_failures`` stays
-    consistent. Returns True when the task was auto-blocked.
+    """Record a non-success and maybe trip the circuit breaker.
 
-    ``release_claim=True, end_run=True``: spawn-failure path (task still
-    running with an open run — restore source phase or ``blocked``, release
-    claim, close run). Both False: timeout/crash path (caller already restored
-    the phase and closed the run; only the counter moves, a trip flips to
-    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
-    ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
-    unconditionally (caller applied its own bounded-retry policy).
+    ``expected_run_id`` is a compare-and-swap receipt: stale callbacks cannot
+    close a newer run. ``sticky_block_kind`` makes a forced trip require an
+    explicit operator unblock instead of immediately re-entering dispatch.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
-    error = error[:500]
+    error = str(_kb.redact_review_value(error or "worker failure"))[:500]
+    if run_summary is not None:
+        run_summary = str(_kb.redact_review_value(run_summary))
+    safe_extra = _kb.redact_review_value(event_payload_extra or {})
+    event_payload_extra = safe_extra if isinstance(safe_extra, dict) else {}
+    if sticky_block_kind is not None and sticky_block_kind not in _kb.VALID_BLOCK_KINDS:
+        raise ValueError(
+            f"sticky_block_kind must be one of {sorted(_kb.VALID_BLOCK_KINDS)} or None"
+        )
     with _kb.write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, block_kind "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+            return False
+        if expected_run_id is not None and end_run:
+            active_run = conn.execute(
+                "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if active_run is None:
+                return False
+        if (
+            expected_run_id is None
+            and sticky_block_kind is not None
+            and row["status"] == "blocked"
+            and row["block_kind"] == sticky_block_kind
+        ):
+            return True
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -1050,9 +1071,14 @@ def _record_task_failure(
             # Timeout/crash path's caller already emitted its own event.
             if end_run:
                 run_id = _kb._end_run(
-                    conn, task_id, outcome=outcome, status=outcome, error=error,
-                    metadata={"failures": failures, "retry_status": retry_status},
+                    conn, task_id, outcome=outcome, status=outcome,
+                    summary=run_summary, error=error,
+                    metadata={"failures": failures, "retry_status": retry_status,
+                              **event_payload_extra},
+                    expected_run_id=expected_run_id,
                 )
+                if run_id is None:
+                    return False
                 _kb._append_event(
                     conn, task_id, outcome,
                     {"error": error, "failures": failures, "retry_status": retry_status},
@@ -1078,33 +1104,71 @@ def _record_task_failure(
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
+        terminal_extra = {**event_payload_extra, "retryable": False}
+        payload.update(terminal_extra)
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
-                conn, task_id, outcome="gave_up", status="gave_up", error=error,
+                conn, task_id, outcome="gave_up", status="gave_up",
+                summary=run_summary, error=error,
                 metadata={
                     "failures": failures,
                     "trigger_outcome": outcome,
                     "effective_limit": effective_limit,
                     "limit_source": limit_source,
                     "retry_status": retry_status,
+                    **terminal_extra,
                 },
+                expected_run_id=expected_run_id,
             )
-        if event_payload_extra:
-            payload.update(event_payload_extra)
+            if run_id is None:
+                return False
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+        if sticky_block_kind is not None:
+            conn.execute(
+                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                "WHERE id = ? AND status = 'blocked'",
+                (sticky_block_kind, task_id),
+            )
+            _kb._append_event(
+                conn, task_id, "blocked",
+                {"reason": error, "kind": sticky_block_kind,
+                 "source_status": retry_status, "automatic": True, **terminal_extra},
+                run_id=run_id,
+            )
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
+def _set_worker_pid(
+    conn: sqlite3.Connection, task_id: str, pid: int, *,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Record the child pid only when the claimed run is still current."""
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
+        run_id = (int(expected_run_id) if expected_run_id is not None
+                  else _kb._current_run_id(conn, task_id))
+        if run_id is None:
+            return False
+        active = conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ? AND t.current_run_id = ? "
+            "AND r.task_id = t.id AND r.ended_at IS NULL",
+            (task_id, run_id),
+        ).fetchone()
+        if active is None:
+            return False
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ? AND current_run_id = ?",
+            (int(pid), task_id, run_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (int(pid), run_id, task_id),
+        )
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1561,6 +1625,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_run_id=claimed.current_run_id,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -1575,7 +1640,11 @@ def _dispatch_lane_task(
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+            if not _set_worker_pid(
+                conn, claimed.id, int(pid), expected_run_id=claimed.current_run_id,
+            ):
+                _kb._terminate_reclaimed_worker(int(pid), claimed.claim_lock)
+                return False
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -1588,6 +1657,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_run_id=claimed.current_run_id,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2122,6 +2192,8 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     # model at a different depth.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
+    if task.max_iterations is not None:
+        cmd.extend(["--max-turns", str(task.max_iterations)])
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -2240,6 +2312,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    if task.max_iterations is not None:
+        env["HERMES_MAX_ITERATIONS"] = str(task.max_iterations)
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"

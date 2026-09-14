@@ -706,6 +706,8 @@ class Task:
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
     max_retries: Optional[int] = None
+    # Per-card agent turn cap; None inherits the worker profile/global default.
+    max_iterations: Optional[int] = None
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
     # done / budget exhausted (-> kanban_block); ``goal_max_turns`` None -> goals default.
     goal_mode: bool = False
@@ -744,7 +746,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "max_iterations", "session_id", "completion_contract",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -913,6 +915,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
     -- config and then ``DEFAULT_FAILURE_LIMIT``.
     max_retries          INTEGER,
+    -- Per-task agent-turn budget. NULL inherits the worker profile/global cap.
+    max_iterations       INTEGER,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -1225,7 +1229,8 @@ def create_task(
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
-    max_retries: Optional[int] = None, model_override: Optional[str] = None,
+    max_retries: Optional[int] = None, max_iterations: Optional[int] = None,
+    model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
@@ -1259,6 +1264,8 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    if max_iterations is not None and int(max_iterations) < 1:
+        raise ValueError("max_iterations must be >= 1")
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1329,10 +1336,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, max_retries, max_iterations, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1340,7 +1347,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
-                        _opt_int(max_retries), model_override, provider_override, reasoning_effort,
+                        _opt_int(max_retries), _opt_int(max_iterations),
+                        model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
                 )
@@ -1862,6 +1870,7 @@ def _append_event(
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
     ``current_run_id``; None when no run was active (never-claimed task)."""
@@ -1869,7 +1878,9 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
-    conn.execute(
+    if expected_run_id is not None and run_id != int(expected_run_id):
+        return None
+    cur = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -1886,7 +1897,12 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if cur.rowcount != 1:
+        return None
+    conn.execute(
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
+    )
     return run_id
 
 
@@ -2136,13 +2152,16 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, from_status: str = "ready",
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Atomically transition ``from_status -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``from_status``). ``blocked`` is accepted
+    only for the atomic same-session adoption path.
     """
+    if from_status not in {"ready", "blocked"}:
+        raise ValueError("from_status must be 'ready' or 'blocked'")
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -2161,7 +2180,7 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(conn, task_id, from_status, lock, expires, now)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
