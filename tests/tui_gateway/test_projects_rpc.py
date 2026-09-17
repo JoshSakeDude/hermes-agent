@@ -340,6 +340,150 @@ def test_scan_time_is_not_treated_as_session_activity(tmp_path):
     assert active["last_active"] > idle["last_active"]
 
 
+def test_remote_scan_empty_roots_defaults_to_backend_home(tmp_path, monkeypatch):
+    """Default discovery scans the session backend's home, not zero roots.
+
+    Desktop's local scanner defines an empty ``repo_scan_roots`` list as a
+    bounded home-directory scan. The remote mirror must preserve that contract
+    or a tunneled backend removes stale client paths without discovering its own
+    repositories.
+    """
+    from hermes_cli import projects_db as pdb
+    import tui_gateway.server as server
+
+    backend_home = tmp_path / "backend-home"
+    repo = backend_home / "projects" / "backend-repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    real_expanduser = os.path.expanduser
+    monkeypatch.setattr(
+        server.os.path,
+        "expanduser",
+        lambda value: str(backend_home) if value == "~" else real_expanduser(value),
+    )
+
+    policy = {"enabled": True, "roots": [], "exclude_paths": []}
+
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert str(repo) in roots
+
+
+def test_remote_scan_matches_depth_junk_and_git_head_contract(tmp_path):
+    from hermes_cli import projects_db as pdb
+    import tui_gateway.server as server
+
+    root = tmp_path / "root"
+    valid = root / "one" / "two" / "valid"
+    too_deep = root / "one" / "two" / "three" / "too-deep"
+    junk = root / "node_modules" / "junk-repo"
+    invalid = root / "invalid"
+    for repo in (valid, too_deep, junk):
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (invalid / ".git").mkdir(parents=True)
+
+    policy = {"enabled": True, "roots": [str(root)], "exclude_paths": []}
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert roots == [str(valid)]
+
+
+def test_remote_scan_normalizes_relative_roots_and_home_exclusions(tmp_path, monkeypatch):
+    from hermes_cli import projects_db as pdb
+    import tui_gateway.server as server
+
+    backend_home = tmp_path / "backend-home"
+    keep = backend_home / "work" / "keep"
+    excluded = backend_home / "work" / "skip" / "excluded"
+    for repo in (keep, excluded):
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    real_expanduser = os.path.expanduser
+
+    def _expand_backend_home(value):
+        if value == "~":
+            return str(backend_home)
+        if str(value).startswith("~/"):
+            return str(backend_home) + str(value)[1:]
+        return real_expanduser(value)
+
+    monkeypatch.setattr(server.os.path, "expanduser", _expand_backend_home)
+    policy = {"enabled": True, "roots": ["work"], "exclude_paths": ["~/work/skip"]}
+
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert roots == [str(keep)]
+
+
+def test_remote_scan_authoritative_empty_result_clears_cache(tmp_path):
+    """A complete scan with zero repos removes stale discovery rows."""
+    from hermes_cli import projects_db as pdb
+    import tui_gateway.server as server
+
+    empty_root = tmp_path / "empty-root"
+    empty_root.mkdir()
+    stale = tmp_path / "stale-repo"
+    (stale / ".git").mkdir(parents=True)
+    (stale / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    policy = {"enabled": True, "roots": [str(empty_root)], "exclude_paths": []}
+
+    with pdb.connect_closing() as conn:
+        pdb.record_discovered_repos(conn, [(str(stale), "stale-repo")])
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert roots == []
+
+
+def test_remote_scan_walk_onerror_preserves_cache(tmp_path, monkeypatch):
+    """Normal os.walk callback errors make the scan non-authoritative."""
+    from hermes_cli import projects_db as pdb
+    import tui_gateway.server as server
+
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    stale = tmp_path / "stale-repo"
+    (stale / ".git").mkdir(parents=True)
+    (stale / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    walk_errors = []
+
+    def _walk_with_error(top, *args, **kwargs):
+        assert top == str(scan_root)
+        onerror = kwargs.get("onerror")
+        if onerror is None:
+            return iter(())
+        walk_errors.append("reported")
+        onerror(OSError("permission denied"))
+        return iter(())
+
+    monkeypatch.setattr(server.os, "walk", _walk_with_error)
+    policy = {"enabled": True, "roots": [str(scan_root)], "exclude_paths": []}
+
+    with pdb.connect_closing() as conn:
+        pdb.record_discovered_repos(conn, [(str(stale), "stale-repo")])
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert walk_errors == ["reported"]
+    assert not authoritative
+    assert str(stale) in roots
+
+
 def test_remote_scan_failure_merges_instead_of_replacing_cache(tmp_path, monkeypatch):
     """A backend scan that can't fully walk its roots must NOT wipe the cache.
 
