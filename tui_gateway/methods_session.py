@@ -323,9 +323,14 @@ def _(rid, params: dict) -> dict:
     parent_session_id = _str_param(params, "parent_session_id") or None
     # Only an explicitly chosen existing workspace persists as cwd; the launch-dir fallback is "No workspace".
     explicit_cwd = False
-    raw_cwd = _str_param(params, "cwd")  # unguarded, as on BASE: only the path check is best-effort
-    with contextlib.suppress(Exception):
-        explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
+    raw_cwd = _str_param(params, "cwd")
+    if raw_cwd and _is_local_terminal_backend():
+        try:
+            explicit_cwd = os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
+        except Exception:
+            explicit_cwd = False
+        if not explicit_cwd:
+            return _err(rid, 4000, f"working directory does not exist: {raw_cwd}")
     _enable_gateway_prompts()
     # ``profile`` (app-global remote mode): stored so the build and every turn re-bind HERMES_HOME.
     profile_home = _profile_home(profile := (params.get("profile") or "").strip() or None)
