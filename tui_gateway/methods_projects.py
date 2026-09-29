@@ -3,6 +3,8 @@ Bodies are rebound onto server.py's globals at install (method_ctx.bind_module).
 
 from __future__ import annotations
 
+import os
+
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -218,11 +220,23 @@ def _scan_discovered_repos_remote(conn, policy: dict) -> bool:
     See #81723.
     """
     from hermes_cli import projects_db as pdb
-    roots = policy.get("roots") or []
-    excludes = policy.get("exclude_paths") or []
+    home = os.path.expanduser("~")
+
+    def _normalize(path: str) -> str:
+        expanded = os.path.expanduser(str(path).strip())
+        return os.path.normpath(
+            expanded if os.path.isabs(expanded) else os.path.join(home, expanded))
+
+    configured_roots = policy.get("roots") or [home]
+    roots = list(dict.fromkeys(
+        _normalize(root) for root in configured_roots if str(root).strip()))
+    excludes = list(dict.fromkeys(
+        _normalize(path) for path in (policy.get("exclude_paths") or []) if str(path).strip()))
     pairs: list[tuple[str, str | None]] = []
     seen: set[str] = set()
     authoritative = True
+    max_depth = 3
+    junk_dirs = {"Applications", "Library", "node_modules", "site-packages", "vendor", "venv"}
 
     def _is_excluded(path: str) -> bool:
         return any(
@@ -234,17 +248,26 @@ def _scan_discovered_repos_remote(conn, policy: dict) -> bool:
             logger.debug("discover_repos scan root missing, skipping: %s", root)
             continue
         try:
-            for dirpath, dirnames, _filenames in os.walk(root):
+            def _walk_error(exc: OSError) -> None:
+                nonlocal authoritative
+                authoritative = False
+                logger.debug("discover_repos scan failed under root %s: %s", root, exc)
+
+            for dirpath, dirnames, _filenames in os.walk(root, onerror=_walk_error):
+                relative = os.path.relpath(dirpath, root)
+                depth = 0 if relative == os.curdir else len(relative.split(os.sep))
                 if _is_excluded(dirpath):
                     dirnames[:] = []
                 elif ".git" in dirnames:  # check BEFORE pruning hidden dirs — `.git` is hidden
-                    if dirpath not in seen:
+                    if os.access(os.path.join(dirpath, ".git", "HEAD"), os.R_OK) and dirpath not in seen:
                         seen.add(dirpath)
                         pairs.append((dirpath, os.path.basename(dirpath)))
                     dirnames[:] = []  # don't hunt nested repos inside a repo
+                elif depth >= max_depth:
+                    dirnames[:] = []
                 else:
                     dirnames[:] = [
-                        d for d in dirnames if not d.startswith(".") and d != "node_modules"]
+                        d for d in dirnames if not d.startswith(".") and d not in junk_dirs]
                 if len(pairs) >= 500:
                     break
         except Exception:
@@ -253,7 +276,7 @@ def _scan_discovered_repos_remote(conn, policy: dict) -> bool:
         if len(pairs) >= 500:  # cap hit: the walk didn't cover the full roots
             authoritative = False
             break
-    if pairs:
+    if pairs or authoritative:
         try:
             pdb.record_discovered_repos(
                 conn, pairs, replace=authoritative, policy_key=_repo_discovery_policy_key(policy))

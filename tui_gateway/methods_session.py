@@ -377,11 +377,24 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
             return _err(rid, 4008, "nothing to branch — send a message first")
     # Only an explicitly chosen existing workspace persists as cwd; the launch-dir fallback is "No workspace".
     explicit_cwd = False
-    raw_cwd = _str_param(params, "cwd")  # unguarded, as on BASE: only the path check is best-effort
-    # An ssh profile's cwd lives on the remote host, where the host isdir check cannot vouch for it.
-    remote_cwd = bool(raw_cwd) and _is_remote_cwd_shape(raw_cwd) and _cwd_is_remote(profile_home)
-    with contextlib.suppress(Exception):
-        explicit_cwd = bool(raw_cwd) and (remote_cwd or os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd))))
+    raw_cwd = _str_param(params, "cwd")
+    backend = _bound_terminal_backend(profile_home)
+    # SSH and container paths belong to the execution backend. The gateway host
+    # cannot stat them; only validate their shape here. Local paths must exist
+    # before any session state is minted.
+    backend_cwd = bool(raw_cwd) and (
+        (backend == "ssh" and _is_remote_cwd_shape(raw_cwd))
+        or (backend not in {"local", "ssh"} and _is_container_path(raw_cwd))
+    )
+    if raw_cwd:
+        try:
+            explicit_cwd = backend_cwd or os.path.isdir(
+                os.path.abspath(os.path.expanduser(raw_cwd)))
+        except Exception:
+            explicit_cwd = backend_cwd
+        if not explicit_cwd:
+            return _err(rid, 4000, f"working directory does not exist: {raw_cwd}")
+    remote_cwd = backend_cwd
     _enable_gateway_prompts()
     session_model_override, create_reasoning_override, create_service_tier_override = _create_overrides(params)
     composer_override_profile = None
