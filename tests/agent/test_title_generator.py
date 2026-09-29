@@ -898,3 +898,22 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+class TestDeriveTitleSkipsCodeFences:
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            ('```json\n{"a": 1}\n```', '{"a": 1}'),
+            ("~~~python\nprint(1)\n~~~", "print(1)"),
+            ('```c#\nConsole.WriteLine("hi");\n```', 'Console.WriteLine("hi");'),
+            ('~~~f#\nprintfn "hi"\n~~~', 'printfn "hi"'),
+            ("```\n```\nwhy is this failing?", "why is this failing?"),
+            ("```\n```", None),
+        ],
+    )
+    def test_titles_from_first_content_line_after_fence_delimiters(self, message, expected):
+        assert derive_title(message) == expected
+
+    def test_fence_like_prose_remains_titleable(self):
+        assert derive_title("```notafence but prose") == "```notafence but prose"
