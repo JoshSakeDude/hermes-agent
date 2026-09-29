@@ -461,6 +461,20 @@ def test_discovered_repo_with_no_sessions_becomes_zero_session_project():
     assert fresh["repos"][0]["groups"] == []
 
 
+def test_discovered_repo_missing_on_backend_is_not_shown():
+    discovered = [
+        {"root": "/Users/dev/mac-only", "label": "mac-only", "sessions": 0, "last_active": 5},
+        {"root": "/home/dev/backend-repo", "label": "backend-repo", "sessions": 0, "last_active": 6},
+    ]
+
+    tree = pt.build_tree(
+        [], [], discovered, resolve=None, hydrate=False,
+        exists=lambda path: path == "/home/dev/backend-repo",
+    )
+
+    assert [project["id"] for project in tree["projects"]] == ["/home/dev/backend-repo"]
+
+
 def test_seeded_folder_repo_does_not_duplicate_a_session_derived_repo():
     # When a folder already has sessions (same git root), seeding must not add a
     # second repo for the same path.

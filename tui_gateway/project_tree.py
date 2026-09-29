@@ -419,7 +419,8 @@ def build_tree(
 
     ``is_junk_root`` flags git roots that must never become an AUTO project; ``is_junk_cwd``
     is the narrower non-git policy (explicit projects are honored regardless); ``exists``
-    keeps a DELETED workspace from becoming a phantom AUTO project (omit on remote backends).
+    keeps a deleted or foreign cached workspace from becoming a phantom AUTO project (omit
+    only when the tree builder cannot stat the session backend).
     ``hydrate`` False empties lane ``sessions`` but keeps counts + ``previewSessions``.
     """
     active_projects = [p for p in projects if not p.get("archived")]
@@ -481,7 +482,7 @@ def build_tree(
         info = resolve(raw_root) if resolve else None
         root = (info or {}).get("repo_root") or raw_root
         root_key = _path_key(root)
-        if root_key in seen or _junk(root) or folder_index.match(root)[0]:
+        if root_key in seen or _junk(root) or not _exists(root) or folder_index.match(root)[0]:
             continue
         seen.add(root_key)
         label = repo.get("label") or base_name(root) or root
