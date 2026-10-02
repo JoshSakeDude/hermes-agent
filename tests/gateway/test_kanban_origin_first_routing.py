@@ -226,6 +226,55 @@ def test_stale_desktop_origin_creates_one_notify_only_fallback(board, monkeypatc
     assert adapter.handled == []  # fallback never wakes a conversation
 
 
+def test_existing_notify_wake_mirror_converts_to_fallback_that_never_wakes(board, monkeypatch):
+    """Fallback role is the final wake guard, even if a stale writer restores the old mirror mode."""
+    tid = _task(title="converted mirror")
+    _blanket_mirror(tid)
+
+    conn = kbc.connect()
+    try:
+        assert kbn.ensure_fallback_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=HOME_CHAT,
+            user_id=HOME_CHAT, notifier_profile="default", start_cursor=0,
+            origin=f"tui:{DESKTOP_KEY}",
+        ) is True
+        # Conversion normally forces notify-only. A concurrent legacy cron can
+        # re-subscribe the same key as notify+wake, so role must remain the
+        # defense-in-depth guarantee that fallback never wakes a conversation.
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=HOME_CHAT,
+            user_id=HOME_CHAT, chat_type="dm", notifier_profile="default",
+            delivery_mode="notify+wake",
+        )
+        kb._append_event(conn, tid, "blocked", {"reason": "needs Josh", "kind": "needs_input"})
+    finally:
+        conn.close()
+
+    (fallback,) = _fallback_rows(tid)
+    assert fallback["delivery_mode"] == "notify+wake"
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert adapter.handled == []
+
+
+def test_originless_passive_cron_row_pings_but_never_wakes(board, monkeypatch):
+    """A bare cron-written notify+wake row is visibility, not an origin conversation."""
+    tid = _task(title="headless cron card")
+    _blanket_mirror(tid)  # no routing metadata: ROLE_PASSIVE when no origin exists
+    _event(tid, "blocked", {"reason": "needs Josh", "kind": "needs_input"})
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert adapter.handled == []
+
+
 # --- Telegram origins -------------------------------------------------------
 
 
@@ -315,6 +364,82 @@ def test_permanent_origin_failure_creates_single_fallback(board, monkeypatch):
     assert adapter.handled == []
     # The dead origin row is retired so it stops spinning.
     assert not [s for s in _subs(tid) if s["chat_id"] == ORIGIN_CHAT]
+
+
+def test_ensure_fallback_second_call_is_noop_and_preserves_progress(board):
+    """Per-task fallback dedup must not rewind a delivered row or rewrite its route identity."""
+    tid = _task()
+    _blanket_mirror(tid)
+    _event(tid, "blocked", {"reason": "first", "kind": "needs_input"})
+
+    conn = kbc.connect()
+    try:
+        event_id = int(conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?", (tid,),
+        ).fetchone()[0])
+        assert kbn.ensure_fallback_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=HOME_CHAT,
+            user_id=HOME_CHAT, notifier_profile="default", start_cursor=event_id - 1,
+            origin=f"tui:{DESKTOP_KEY}",
+        ) is True
+        kbn.advance_notify_cursor(
+            conn, task_id=tid, platform="telegram", chat_id=HOME_CHAT,
+            new_cursor=event_id,
+        )
+        kbn.record_notify_ping(
+            conn, task_id=tid, platform="telegram", chat_id=HOME_CHAT,
+            event_id=event_id,
+        )
+        before = kbn.list_notify_subs(conn, tid)[0]
+
+        assert kbn.ensure_fallback_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=HOME_CHAT,
+            user_id="different-user", notifier_profile="different-profile",
+            start_cursor=0, origin="telegram:other-origin",
+        ) is False
+        after = kbn.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+
+    assert after == before
+    assert after["last_event_id"] == event_id
+    assert after["last_ping_event_id"] == event_id
+    assert after["delivery_metadata"] == before["delivery_metadata"]
+
+
+def test_later_desktop_stale_scan_does_not_rewind_or_redeliver_fallback(board, monkeypatch):
+    """The stale scan keeps seeing the unclaimed Desktop event, but fallback creation is one-shot."""
+    tid = _task(title="stale scan dedup")
+    _desktop_origin(tid)
+    _blanket_mirror(tid)
+    _event(tid, "blocked", {"reason": "needs Josh", "kind": "needs_input"})
+    _age_events(tid, 3600)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    _tick(monkeypatch, runner)
+    assert len(adapter.sent) == 1
+    before = _fallback_rows(tid)[0]
+
+    real_ensure = kbn.ensure_fallback_notify_sub
+    calls = []
+
+    def recording_ensure(conn, **kwargs):
+        row_before = kbn.list_notify_subs(conn, tid)
+        result = real_ensure(conn, **kwargs)
+        row_after = kbn.list_notify_subs(conn, tid)
+        calls.append((result, row_before, row_after))
+        return result
+
+    monkeypatch.setattr(kbn, "ensure_fallback_notify_sub", recording_ensure)
+    _tick(monkeypatch, runner)
+
+    assert calls, "later stale scan must exercise the existing-fallback guard"
+    assert all(result is False and rows_before == rows_after
+               for result, rows_before, rows_after in calls)
+    assert _fallback_rows(tid)[0] == before
+    assert len(adapter.sent) == 1
+    assert adapter.handled == []
 
 
 def test_fallback_is_deduplicated_across_ticks_and_events(board, monkeypatch):
