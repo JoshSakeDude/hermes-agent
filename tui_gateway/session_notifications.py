@@ -354,7 +354,7 @@ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
         return slug, f"slug:{slug}"
 
 
-def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
+def _kb_poll_board(_kb, slug: str, session_key: str, origin_first: bool = False) -> list:
     """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
     writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
     falls through so delivery is preserved)."""
@@ -379,6 +379,12 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
             sub_ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
                              thread_id=sub.get("thread_id") or "")
             _old, _new, events = _kbn.claim_unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS, **sub_ident)
+            if origin_first and events:
+                # Mirrors stay silent; an origin hears only actionable events (no churn turns).
+                from gateway import kanban_notify_routing as _routing
+                siblings = [s for s in subs if s.get("task_id") == sub["task_id"]]
+                events = ([] if _routing.sub_role(sub, siblings) == _routing.ROLE_MIRROR
+                          else [ev for ev in events if _routing.is_actionable(ev)])
             if not events:
                 continue
             task = _kb.get_task(conn, sub["task_id"])
@@ -421,7 +427,12 @@ def _collect_kanban_notifications(session: dict) -> list:
     unique = {}
     for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
         unique.setdefault(resolved, slug)
-    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key)]
+    origin_first = False
+    with contextlib.suppress(Exception):
+        from gateway import kanban_notify_routing as _routing
+        from hermes_cli.config import load_config
+        origin_first = _routing.routing_mode(load_config()) == _routing.ORIGIN_FIRST
+    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key, origin_first)]
 
 
 def _notif_poll_kanban(sid: str, session: dict) -> None:

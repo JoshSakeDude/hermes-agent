@@ -1492,6 +1492,7 @@ def _inherit_notify_subs(
                COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
+           AND COALESCE(delivery_metadata, '') NOT LIKE '%"route_role":"fallback"%'
         """,
         (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
     )
