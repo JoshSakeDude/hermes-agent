@@ -330,8 +330,11 @@ def _kb_gateway_terminal_text(kind: str, sub: dict, task, payload: dict, board_s
     head = _kb_gateway_head(sub, task, board_slug)
     if kind == "gave_up":
         if payload.get("reason_code") == "iteration_budget_exhausted":
-            return t("gateway.kanban.ping.budget_exhausted", head=head,
-                     used=payload.get("budget_used") or "?", max=payload.get("budget_max") or "?")
+            followup_task_id = payload.get("followup_task_id")
+            key = ("gateway.kanban.ping.budget_exhausted_followup" if followup_task_id
+                   else "gateway.kanban.ping.budget_exhausted_split_needed")
+            return t(key, head=head, used=payload.get("budget_used") or "?",
+                     max=payload.get("budget_max") or "?", followup_task_id=followup_task_id or "")
         raw_error = payload.get("error")
         error = t("gateway.kanban.ping.error_line", value=str(raw_error)[:160]) if raw_error else ""
         failures = payload.get("failures")

@@ -199,12 +199,10 @@ def test_pending_response_records_nonretryable_iteration_exhaustion(monkeypatch)
             "block_cause": "iteration_budget_exhausted",
             "reason_code": "iteration_budget_exhausted",
             "retryable": False,
-            "operator_hint": (
-                "Split the card into smaller cards (one deliverable, one stage), "
-                "then unblock or archive it. Do not raise its limit."
-            ),
-        },
-    )
+            "operator_hint": "A split follow-up will be queued; do not retry or raise the limit.",
+            },
+            on_trip=ANY,
+            )
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):

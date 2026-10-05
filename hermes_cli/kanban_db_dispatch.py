@@ -1356,6 +1356,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    on_trip: Optional[Callable[[], None]] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1482,6 +1483,17 @@ def _record_task_failure(
             # judge this block: ``recompute_ready`` holds it for an operator.
             payload["sticky"] = True
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+        if on_trip is not None:
+            # Follow-up work is best-effort.  The terminal block is the safety
+            # invariant, so a callback failure must not roll back this write
+            # transaction and leave the exhausted card dispatchable again.
+            try:
+                on_trip()
+            except Exception:
+                _kb._log.warning(
+                    "kanban failure trip callback failed for task %s", task_id,
+                    exc_info=True,
+                )
         return True
 
 

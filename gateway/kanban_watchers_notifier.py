@@ -645,10 +645,16 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
 
 def _fmt_gave_up(ev, n) -> tuple:
     if _payload(ev, "reason_code") == "iteration_budget_exhausted":
+        followup_task_id = _payload(ev, "followup_task_id")
+        key = (
+            "gateway.kanban.ping.budget_exhausted_followup"
+            if followup_task_id else "gateway.kanban.ping.budget_exhausted_split_needed"
+        )
         return t(
-            "gateway.kanban.ping.budget_exhausted", head=n.head,
+            key, head=n.head,
             used=_payload(ev, "budget_used") or "?",
             max=_payload(ev, "budget_max") or "?",
+            followup_task_id=followup_task_id or "",
         ), None, None
     failures = _payload(ev, "failures")
     error = _clip(ev, "error", "gateway.kanban.ping.error_line", 160)
@@ -847,7 +853,19 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
-        self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
+        budget_events = [
+            ev for ev in self.d["events"]
+            if ev.kind == "gave_up" and _payload(ev, "reason_code") == "iteration_budget_exhausted"
+        ]
+        if budget_events:
+            followup_task_id = _payload(budget_events[-1], "followup_task_id")
+            guidance = t(
+                "gateway.kanban.wake.budget_exhausted_followup",
+                followup_task_id=followup_task_id,
+            ) if followup_task_id else t("gateway.kanban.wake.budget_exhausted_split_needed")
+        else:
+            guidance = t("gateway.kanban.wake.guidance")
+        self.synth = synth + "\n\n" + guidance
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

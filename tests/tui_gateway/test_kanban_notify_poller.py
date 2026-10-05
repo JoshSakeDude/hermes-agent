@@ -258,7 +258,7 @@ class TestFormatKanbanEventText:
         })
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "iteration budget exhausted (45/45)" in text
-        assert "split the card" in text
+        assert "split needed" in text
         assert "no automatic retry" in text
         assert "spawn failures" not in text
 

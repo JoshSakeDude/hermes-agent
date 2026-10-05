@@ -1438,6 +1438,133 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
+def create_split_followup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    budget_used: int,
+    budget_max: int,
+    handoff_summary: Optional[str] = None,
+) -> Optional[str]:
+    """Queue one depth-bounded orchestrator card after budget exhaustion.
+
+    The caller invokes this only after the original card's sticky ``gave_up``
+    transition won its run-id CAS.  A ``split:<original>`` idempotency key plus
+    the outer IMMEDIATE transaction makes repeated calls converge on one card.
+    Split cards and cards created by a split card are deliberately terminal at
+    this point: their exhaustion is reported, but never recursively fanned out.
+    """
+    with write_txn(conn, allow_nested=True):
+        original = conn.execute(
+            "SELECT id, title, body, assignee, tenant, session_id, idempotency_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if original is None:
+            return None
+
+        skip_reason = None
+        if str(original["idempotency_key"] or "").startswith("split:"):
+            skip_reason = "split_card"
+        else:
+            created = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            creator_id = _json_dict(created["payload"]).get("creator_task_id") if created else None
+            if creator_id:
+                creator = conn.execute(
+                    "SELECT idempotency_key FROM tasks WHERE id = ?", (creator_id,),
+                ).fetchone()
+                if creator and str(creator["idempotency_key"] or "").startswith("split:"):
+                    skip_reason = "split_child"
+
+        if skip_reason:
+            prior = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'split_followup_skipped' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if not prior:
+                _append_event(conn, task_id, "split_followup_skipped", {"reason": skip_reason})
+            return None
+
+        from hermes_cli.config import load_config_readonly
+
+        try:
+            cfg = load_config_readonly() or {}
+        except Exception:
+            cfg = {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        orchestrator = (
+            str(kanban_cfg.get("orchestrator_profile") or "").strip()
+            if isinstance(kanban_cfg, dict) else ""
+        ) or "default"
+
+        safe_title = str(redact_review_value(original["title"] or ""))
+        safe_body = str(redact_review_value(original["body"] or ""))[:4000]
+        safe_handoff = str(redact_review_value(handoff_summary or "(no worker handoff was captured)"))
+        body = f"""# Split oversized card
+
+Original card: {task_id} — {safe_title}
+Iteration budget: {int(budget_used)}/{int(budget_max)}
+Original assignee lane: {original['assignee'] or '(unassigned)'}
+
+## Original body (redacted, truncated to 4,000 characters)
+{safe_body or '(empty)'}
+
+## Worker handoff (redacted)
+{safe_handoff}
+
+## Required split procedure
+1. Read the original card, its runs and handoff, and any worktree or branch it used. Determine exactly what is done and what remains.
+2. Create small linked replacement cards for the remaining work only. Each card must have one deliverable and one stage, no more than four substantive steps, and fit well inside 45 turns. Use the original assignee lane and tenant. Give every code card its own worktree. Put a verification child on every card that changes live state.
+3. Never re-run or unblock the original. Never raise any iteration limit. Never duplicate finished work.
+4. Comment on the original with all replacement task IDs, then retire it as superseded with `hermes kanban archive {task_id}`. The current worker CLI permits `kanban archive` and routes it to `kanban_db.archive_task`.
+5. External, live, or customer-facing actions still require Josh's explicit approval.
+"""
+        followup_id = create_task(
+            conn,
+            title=f"Split oversized card {task_id}: {safe_title}",
+            body=body,
+            assignee=orchestrator,
+            created_by="dispatcher",
+            workspace_kind="scratch",
+            tenant=original["tenant"],
+            idempotency_key=f"split:{task_id}",
+            max_iterations=25,
+            goal_mode=False,
+            session_id=original["session_id"],
+            creator_task_id=task_id,
+        )
+
+        created_event = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'split_followup_created' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if not created_event:
+            _append_event(conn, task_id, "split_followup_created", {"followup_task_id": followup_id})
+
+        gave_up = conn.execute(
+            "SELECT id, run_id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'gave_up' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if gave_up:
+            payload = _json_dict(gave_up["payload"])
+            payload["followup_task_id"] = followup_id
+            conn.execute("UPDATE task_events SET payload = ? WHERE id = ?", (_json_or_null(payload), gave_up["id"]))
+            if gave_up["run_id"] is not None:
+                run = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (gave_up["run_id"],)).fetchone()
+                metadata = _json_dict(run["metadata"]) if run else {}
+                metadata["followup_task_id"] = followup_id
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (_json_or_null(metadata), gave_up["run_id"]),
+                )
+        return followup_id
+
+
 def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
 

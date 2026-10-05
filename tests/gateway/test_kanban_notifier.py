@@ -672,9 +672,56 @@ def test_gateway_and_tui_agree_on_iteration_budget_exhaustion():
     )
     assert gateway_text == tui_text
     assert "iteration budget exhausted (45/45)" in gateway_text
-    assert "split the card" in gateway_text
+    assert "split needed" in gateway_text
     assert "no automatic retry" in gateway_text
     assert "spawn failures" not in gateway_text
+
+
+def test_iteration_budget_notification_names_queued_split_followup():
+    from tui_gateway.server import _format_kanban_event_text
+
+    payload = {
+        "reason_code": "iteration_budget_exhausted", "budget_used": 45, "budget_max": 45,
+        "followup_task_id": "t_split123",
+    }
+    gateway_text = _fmt_terminal("gave_up", payload)
+    tui_text = _format_kanban_event_text(
+        {"task_id": "t_abc123"},
+        type("Task", (), {"title": "task", "assignee": None, "result": None})(),
+        type("Event", (), {"kind": "gave_up", "payload": payload})(),
+        "",
+    )
+    assert gateway_text == tui_text
+    assert "t_split123" in gateway_text
+    assert "queued" in gateway_text.lower()
+    assert "iteration budget exhausted (45/45)" in gateway_text
+    assert "no automatic retry" in gateway_text
+    assert "spawn failures" not in gateway_text
+
+
+def test_iteration_budget_wake_guidance_names_queued_split_followup():
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+
+    task = type("Task", (), {
+        "title": "large task", "assignee": "worker", "session_id": "session-1",
+    })()
+    event = type("Event", (), {"kind": "gave_up", "payload": {
+        "reason_code": "iteration_budget_exhausted", "followup_task_id": "t_split123",
+    }})()
+    sub = {
+        "task_id": "t_original", "platform": "telegram", "chat_id": "chat-1",
+        "thread_id": "", "delivery_mode": "notify+wake", "notifier_profile": "",
+    }
+    notification = _KanbanNotification(
+        type("Runner", (), {})(),
+        {"sub": sub, "task": task, "events": [event], "board": "default"},
+        platform_cls=None,
+        sub_fail_counts={},
+    )
+    notification.build_wake_text()
+    assert "t_split123" in notification.synth
+    assert "queued automatically" in notification.synth
+    assert "not a request to decompose" not in notification.synth
 
 
 def test_gateway_generic_gave_up_and_unknown_timeout_are_truthful():
