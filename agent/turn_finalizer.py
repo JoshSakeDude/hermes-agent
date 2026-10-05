@@ -45,9 +45,10 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
 
 
 def _record_kanban_budget_exhausted(
-    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
+    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger,
+    handoff_summary: Optional[str] = None,
 ) -> None:
-    """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
+    """Record a sticky terminal outcome for a kanban worker out of budget.
 
     Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
     consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
@@ -57,8 +58,22 @@ def _record_kanban_budget_exhausted(
     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
     from multiple exit paths.
     """
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    expected_run_id = None
+    if raw_run_id is not None:
+        try:
+            expected_run_id = int(raw_run_id)
+        except (TypeError, ValueError):
+            expected_run_id = 0
+        if expected_run_id <= 0:
+            logger.warning(
+                "Cannot record budget exhaustion for Kanban task %s: "
+                "invalid dispatcher run identity %r",
+                kanban_task,
+                raw_run_id,
+            )
+            return
     try:
-        from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_dispatch as _kbd
         _conn = _kbc.connect()
@@ -68,12 +83,25 @@ def _record_kanban_budget_exhausted(
                 kanban_task,
                 error=(
                     f"Iteration budget exhausted ({api_call_count}/{max_iterations}) — "
-                    "task could not complete within the allowed iterations"
+                    "this card is too large for its iteration budget and must be split"
                 ),
-                outcome="timed_out",
+                outcome="iteration_budget_exhausted",
+                force_trip=True,
                 release_claim=True,
                 end_run=True,
-                event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                run_summary=handoff_summary,
+                expected_run_id=expected_run_id,
+                event_payload_extra={
+                    "budget_used": api_call_count,
+                    "budget_max": max_iterations,
+                    "block_cause": "iteration_budget_exhausted",
+                    "reason_code": "iteration_budget_exhausted",
+                    "retryable": False,
+                    "operator_hint": (
+                        "Split the card into smaller cards (one deliverable, one stage), "
+                        "then unblock or archive it. Do not raise its limit."
+                    ),
+                },
             )
         finally:
             with suppress(Exception):
@@ -180,16 +208,22 @@ def _resolve_budget_fallback(
     # If running as a kanban worker, signal the dispatcher that the worker could not complete (rather than
     # treating it as a protocol violation). This applies whether the user-facing fallback came from the
     # summary call or an explicitly pending continuation; both exhausted the task budget and must advance
-    # the failure circuit. We route through ``_record_task_failure(outcome="timed_out")`` rather than
-    # ``kanban_block`` so this counts toward the dispatcher's consecutive-failure circuit breaker (#29747
-    # gap 2).
+    # failure circuit. We route through ``_record_task_failure`` rather than
+    # ``kanban_block`` so this becomes a sticky failure in Alerts rather than a
+    # needs-input item in Approvals (#29747 gap 2).
     # Bounded fallback (#87096): budget was exhausted but none of the normal fallback paths were eligible
     # (interrupted / failed / anomalous exit_reason). If running as a kanban worker we must still record a
     # terminal outcome so the task does not remain in an ambiguous lifecycle state. The worker's run is
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
     if _kanban_task:
-        _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
+        _record_kanban_budget_exhausted(
+            _kanban_task,
+            api_call_count,
+            agent.max_iterations,
+            logger,
+            handoff_summary=flatten_message_text(final_response).strip() or None,
+        )
     return final_response, _turn_exit_reason, preserved_verification_fallback, interrupted
 
 
