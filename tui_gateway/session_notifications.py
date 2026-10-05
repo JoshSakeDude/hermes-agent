@@ -313,20 +313,48 @@ def _kb_completed(task, payload: dict, title: str) -> str:
     return f" done — {title}{handoff}"
 
 
-def _kb_timed_out(task, payload: dict, title: str) -> str:
-    with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
+def _kb_gateway_head(sub: dict, task, board_slug: str) -> str:
+    from agent.i18n import t
+
+    board_tag = t("gateway.kanban.ping.board_tag", board=board_slug) if board_slug else ""
+    who = getattr(task, "assignee", None) or ""
+    assignee_tag = t("gateway.kanban.ping.assignee_tag", assignee=who) if who else ""
+    return t("gateway.kanban.ping.head", board_tag=board_tag, assignee_tag=assignee_tag,
+             task_id=sub.get("task_id", ""))
+
+
+def _kb_gateway_terminal_text(kind: str, sub: dict, task, payload: dict, board_slug: str) -> str:
+    """Use the gateway's i18n keys so Desktop/TUI and chat notifications cannot drift."""
+    from agent.i18n import t
+
+    head = _kb_gateway_head(sub, task, board_slug)
+    if kind == "gave_up":
+        if payload.get("reason_code") == "iteration_budget_exhausted":
+            return t("gateway.kanban.ping.budget_exhausted", head=head,
+                     used=payload.get("budget_used") or "?", max=payload.get("budget_max") or "?")
+        raw_error = payload.get("error")
+        error = t("gateway.kanban.ping.error_line", value=str(raw_error)[:160]) if raw_error else ""
+        failures = payload.get("failures")
+        if failures:
+            return t("gateway.kanban.ping.gave_up_failures", head=head,
+                     failures=int(failures), error=error)
+        return t("gateway.kanban.ping.gave_up_repeated", head=head, error=error)
+
+    try:
+        limit = int(payload.get("limit_seconds") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    minutes = max(1, round(limit / 60)) if limit else 0
+    span = (t("gateway.kanban.ping.limit_minutes", minutes=minutes) if minutes
+            else t("gateway.kanban.ping.limit_generic"))
+    return t("gateway.kanban.ping.timed_out", head=head, span=span)
 
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
 _KANBAN_EVENT_FORMATTERS = {
     "completed": ("✔", _kb_completed),
     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
-    "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"
-                + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
     "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
-    "timed_out": ("⏱", _kb_timed_out),
     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
 }
 
@@ -334,7 +362,10 @@ _KANBAN_EVENT_FORMATTERS = {
 def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
     """Single-line notification text for one kanban event; wording mirrors gateway/kanban_watchers.py (reads the same
     as on Telegram). None for silent kinds."""
-    if (entry := _KANBAN_EVENT_FORMATTERS.get(getattr(ev, "kind", ""))) is None:
+    kind = getattr(ev, "kind", "")
+    if kind in {"gave_up", "timed_out"}:
+        return _kb_gateway_terminal_text(kind, sub, task, getattr(ev, "payload", None) or {}, board_slug)
+    if (entry := _KANBAN_EVENT_FORMATTERS.get(kind)) is None:
         return None
     glyph, fmt = entry
     task_id = sub.get("task_id", "")

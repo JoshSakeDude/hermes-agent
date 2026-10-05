@@ -247,7 +247,28 @@ class TestFormatKanbanEventText:
     def test_timed_out_with_bad_payload_does_not_raise(self):
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
-        assert "timed out" in text
+        assert "timed out" in text or "ran past" in text
+        assert "max_runtime=0s" not in text
+
+    def test_iteration_budget_exhaustion_is_truthful_and_actionable(self):
+        ev = SimpleNamespace(kind="gave_up", payload={
+            "reason_code": "iteration_budget_exhausted",
+            "budget_used": 45,
+            "budget_max": 45,
+        })
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "iteration budget exhausted (45/45)" in text
+        assert "split the card" in text
+        assert "no automatic retry" in text
+        assert "spawn failures" not in text
+
+    def test_generic_gave_up_never_claims_spawn_failures(self):
+        ev = SimpleNamespace(kind="gave_up", payload={"failures": 3, "error": "worker crashed"})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "blocked after 3 failures" in text
+        assert "no automatic retry" in text
+        assert "worker crashed" in text
+        assert "spawn failures" not in text
 
 
 class TestNotificationPollerLoopKanbanWiring:

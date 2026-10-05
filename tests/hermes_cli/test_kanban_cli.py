@@ -72,6 +72,31 @@ def test_kanban_show_json_includes_runtime_limit(kanban_home):
     assert uncapped["task"]["max_runtime_seconds"] is None
 
 
+def test_create_and_show_iteration_budget(kanban_home):
+    import re
+
+    created = kc.run_slash("create 'bounded iterations' --max-iterations 20")
+    match = re.search(r"t_[a-f0-9]+", created)
+    assert match is not None
+    task_id = match.group(0)
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.max_iterations == 20
+    assert "max-iterations: 20 (task)" in kc.run_slash(f"show {task_id}")
+
+    default_created = kc.run_slash("create 'default iterations'")
+    default_match = re.search(r"t_[a-f0-9]+", default_created)
+    assert default_match is not None
+    default_id = default_match.group(0)
+    assert "max-iterations: inherits profile max_turns" in kc.run_slash(f"show {default_id}")
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_create_rejects_non_positive_iteration_budget(kanban_home, bad):
+    output = kc.run_slash(f"create invalid --max-iterations {bad}")
+    assert "must be >= 1" in output
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kbc.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

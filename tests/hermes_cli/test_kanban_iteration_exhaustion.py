@@ -232,7 +232,9 @@ def test_worker_argv_passes_card_budget_as_chat_flag(monkeypatch):
 
     from hermes_cli._parser import build_top_level_parser
     parser = build_top_level_parser()[0]
-    parsed = parser.parse_args(argv[1:])
+    # -p/--profile is consumed before the top-level argparse parser runs; feed
+    # the parser the post-preparse argv starting at the chat subcommand.
+    parsed = parser.parse_args(argv[chat:])
     assert parsed.max_turns == 20
     assert parsed.query == "work kanban task t_budget"
 

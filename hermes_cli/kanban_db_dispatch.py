@@ -2791,7 +2791,13 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.append("chat")
+    # This is a CHAT subcommand flag, not a global flag.  Placing it before
+    # ``chat`` makes argparse exit 2, while relying on HERMES_MAX_ITERATIONS is
+    # ineffective when the worker profile has an explicit agent.max_turns.
+    if task.max_iterations is not None:
+        cmd.extend(["--max-turns", str(task.max_iterations)])
+    cmd.extend(["-q", f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd

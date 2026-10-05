@@ -644,17 +644,25 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
 
 
 def _fmt_gave_up(ev, n) -> tuple:
-    # The dispatcher auto-blocked the task after ``failures`` consecutive non-success attempts
-    # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
+    if _payload(ev, "reason_code") == "iteration_budget_exhausted":
+        return t(
+            "gateway.kanban.ping.budget_exhausted", head=n.head,
+            used=_payload(ev, "budget_used") or "?",
+            max=_payload(ev, "budget_max") or "?",
+        ), None, None
     failures = _payload(ev, "failures")
-    count = (t("gateway.kanban.ping.failed_n_times", count=int(failures)) if failures
-             else t("gateway.kanban.ping.kept_failing"))
-    last = _clip(ev, "error", "gateway.kanban.ping.last_error", 160)
-    return t("gateway.kanban.ping.gave_up", head=n.head, count=count, last=last, task_id=n.task_id), None, None
+    error = _clip(ev, "error", "gateway.kanban.ping.error_line", 160)
+    if failures:
+        return t("gateway.kanban.ping.gave_up_failures", head=n.head,
+                 failures=int(failures), error=error), None, None
+    return t("gateway.kanban.ping.gave_up_repeated", head=n.head, error=error), None, None
 
 
 def _fmt_timed_out(ev, n) -> tuple:
-    limit = int(_payload(ev, "limit_seconds") or 0)
+    try:
+        limit = int(_payload(ev, "limit_seconds") or 0)
+    except (TypeError, ValueError):
+        limit = 0
     minutes = max(1, round(limit / 60)) if limit else 0
     span = t("gateway.kanban.ping.limit_minutes", minutes=minutes) if minutes else t("gateway.kanban.ping.limit_generic")
     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None

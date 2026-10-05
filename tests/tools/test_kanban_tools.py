@@ -600,10 +600,37 @@ def test_create_happy_path(worker_env):
     conn = kbc.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
+        assert child is not None
         assert child.title == "child task"
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_create_forwards_iteration_and_retry_budgets(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "bounded child", "assignee": "peer",
+        "max_iterations": 20, "max_retries": 1,
+    }))
+    assert result["ok"] is True
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, result["task_id"])
+        assert task is not None
+        assert task.max_iterations == 20
+        assert task.max_retries == 1
+
+
+@pytest.mark.parametrize("field", ["max_iterations", "max_retries"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_create_rejects_non_positive_budgets(worker_env, field, bad):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({"title": "bad", "assignee": "peer", field: bad}))
+    assert f"{field} must be >= 1" in result["error"]
 
 
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])

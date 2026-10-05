@@ -443,6 +443,24 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "dispatcher SIGTERMs the worker and re-queues the "
                 "task with outcome='timed_out'."
         )),
+        "max_iterations": {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "Per-card agent iteration budget. Defaults to inheriting the profile's "
+                "max_turns (normally 45). A card that needs more than 45 iterations is "
+                "too big and must be split; exhaustion blocks the card with no automatic retry."
+            ),
+        },
+        "max_retries": {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "Per-card consecutive-failure limit. Defaults to the dispatcher setting. "
+                "Iteration-budget exhaustion blocks immediately with no automatic retry; "
+                "a card that needs more than the inherited 45 iterations must be split."
+            ),
+        },
         "initial_status": {
             "type": "string",
             "enum": ["running", "blocked"],
