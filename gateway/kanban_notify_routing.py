@@ -118,9 +118,9 @@ def _stamped_role(sub: dict) -> Optional[str]:
     ) else None
 
 
-# Not persisted: an unstamped, metadata-less row (CLI/cron-written, e.g. the home-DM
-# blanket subscriber) on a card with no origin at all. It keeps visibility for headless
-# cards but delivers notify-only — it is not anyone's conversation, so it never wakes.
+# Not persisted: an unstamped non-Desktop row on a card with no origin at all. It keeps
+# visibility for headless cards but delivers notify-only — it is not anyone's conversation,
+# so it never wakes. Genuine conversation origins are stamped by the creator path.
 ROLE_PASSIVE = "passive"
 
 
@@ -129,9 +129,9 @@ def sub_role(sub: dict, siblings: Iterable[dict]) -> str:
 
     Stamped rows keep their stamp. For unstamped (pre-activation) rows: when a stamped
     origin exists every other row is a mirror; otherwise a Desktop (``tui``) row is the
-    origin and other rows mirror it. With no Desktop row, an unstamped row written by a
-    session-aware path (it carries routing metadata) is the origin; a bare CLI/cron row
-    is passive.
+    origin and other rows mirror it. With no Desktop row, every unstamped non-Desktop row
+    is passive; only an explicit ``route_role=origin`` stamp proves that it is a genuine
+    conversation rather than a retired cron/home-DM mirror with incidental metadata.
     """
     stamped = _stamped_role(sub)
     if stamped:
@@ -143,7 +143,7 @@ def sub_role(sub: dict, siblings: Iterable[dict]) -> str:
         return ROLE_ORIGIN
     if any((r.get("platform") or "").lower() == "tui" for r in rows):
         return ROLE_MIRROR
-    return ROLE_ORIGIN if _meta(sub) else ROLE_PASSIVE
+    return ROLE_PASSIVE
 
 
 def describe_origin(sub: dict) -> str:

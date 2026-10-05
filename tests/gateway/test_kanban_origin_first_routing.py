@@ -13,6 +13,7 @@ Policy under test:
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -49,12 +50,12 @@ class RecordingAdapter:
         event._gateway_accepted = True
 
 
-def _make_runner(adapter, *, home=True):
+def _make_runner(adapter, *, home=True, started_at=0):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
-    # Every test DB is fresh. Pin the process-start guard before its first event
-    # so headless-route tests cannot race an integer-second boundary.
-    runner._kanban_notify_started_at = 0
+    # Most tests build a fresh board before constructing the runner. Let them opt
+    # out of the production start guard; backlog regressions pass a real timestamp.
+    runner._kanban_notify_started_at = started_at
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
     runner._kanban_dispatcher_lock_handle = object()
@@ -294,6 +295,52 @@ def test_originless_passive_cron_row_routes_to_ops_and_never_wakes_fred(board, m
     assert tid in adapter.sent[0]["text"]
     assert adapter.handled == []
     assert HOME_CHAT not in [s["chat_id"] for s in adapter.sent]
+
+
+def test_unstamped_home_dm_metadata_is_not_an_origin(board, monkeypatch):
+    """Incidental metadata on a retired Fred row cannot turn it into an origin."""
+    tid = _task(title="metadata-only cron card")
+    _sub(tid, platform="telegram", chat_id=HOME_CHAT, user_id=HOME_CHAT, chat_type="dm",
+         notifier_profile="default", delivery_mode="notify+wake",
+         delivery_metadata={"chat_type": "dm"})
+    _complete(tid)
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert _sent_destinations(adapter) == [(OPS_CHAT, TOPICS["ops"])]
+    assert HOME_CHAT not in [s["chat_id"] for s in adapter.sent]
+
+
+def test_activation_ignores_subscription_backlog_but_routes_new_events(board, monkeypatch):
+    """A fresh notifier must not replay months of unseen Desktop-origin events."""
+    failure = _task(title="old desktop failure")
+    _desktop_origin(failure)
+    _event(failure, "gave_up", {"failures": 2, "error": "old boom"})
+    decision = _task(title="old desktop decision")
+    _desktop_origin(decision)
+    _event(decision, "blocked", {"kind": "needs_input", "reason": "old choice"})
+    _age_events(failure, 30 * 86400)
+    _age_events(decision, 30 * 86400)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter, started_at=int(time.time()))
+    _tick(monkeypatch, runner, n=2)
+
+    assert adapter.sent == []
+    assert _topic_rows(failure, "alerts") == []
+    assert _topic_rows(decision, "approvals") == []
+
+    _event(failure, "gave_up", {"failures": 3, "error": "new boom"})
+    _event(decision, "blocked", {"kind": "needs_input", "reason": "new choice"})
+    _tick(monkeypatch, runner, n=2)
+
+    assert sorted(_sent_destinations(adapter)) == sorted([
+        (OPS_CHAT, TOPICS["alerts"]),
+        (OPS_CHAT, TOPICS["approvals"]),
+    ])
+    assert len(_topic_rows(failure, "alerts")) == 1
+    assert len(_topic_rows(decision, "approvals")) == 1
 
 
 @pytest.mark.parametrize("kind,payload", [

@@ -438,6 +438,11 @@ class _Collector:
                       if origins else "automation (script/cron/CLI)")
             role_events: dict[str, list[Any]] = {}
             for ev in sorted(unseen.values(), key=lambda item: item.id):
+                # Subscription cursors can remain untouched for months (notably
+                # pull-based Desktop origins). Match the headless-card guard below:
+                # activation may route only events created during this notifier run.
+                if ev.created_at < self.started_at:
+                    continue
                 if not _routing.is_actionable(ev):
                     continue
                 role = _routing.event_topic_role(ev) if origins else _routing.ROLE_OPS
