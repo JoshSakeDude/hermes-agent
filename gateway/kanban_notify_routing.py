@@ -15,9 +15,9 @@ Under ``origin_first``:
   consecutive-failure count is stored in the row so restarts cannot reset it.
 * **Exactly one fallback.** After ``MAX_SEND_FAILURES`` consecutive origin failures —
   or a Desktop origin leaving an actionable event unclaimed for longer than
-  ``kanban.origin_stale_seconds`` (default 600s) — one notify-only row is created on the
-  platform home channel (``TELEGRAM_HOME_CHANNEL``). It never wakes a conversation and
-  names the card and the unreachable origin. Dedup is per task.
+  ``kanban.origin_stale_seconds`` (default 600s) — one notify-only row is created in the
+  configured Gohan Ops Alerts topic. It never wakes a conversation and names the card and
+  the unreachable origin. Dedup is per task; the Telegram home DM is never a fallback.
 * **Internal events are silent.** Heartbeats, claims, spawns, promotions, dependency
   waits, routine status/review churn and auto-retried crashes/timeouts never reach Josh;
   only completion, real blocks (incl. ``status→blocked``), give-ups and triage escalations do.
@@ -29,8 +29,11 @@ import time
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_db_notify import (
+    ROLE_ALERTS,
+    ROLE_APPROVALS,
     ROLE_FALLBACK,
     ROLE_MIRROR,
+    ROLE_OPS,
     ROLE_ORIGIN,
     ROUTE_FAILURES_KEY,
     ROUTE_ORIGIN_KEY,
@@ -38,9 +41,11 @@ from hermes_cli.kanban_db_notify import (
 )
 
 __all__ = [
-    "ROUTE_ROLE_KEY", "ROLE_ORIGIN", "ROLE_MIRROR", "ROLE_FALLBACK", "ROLE_PASSIVE", "ORIGIN_FIRST", "LEGACY",
+    "ROUTE_ROLE_KEY", "ROLE_ORIGIN", "ROLE_MIRROR", "ROLE_FALLBACK", "ROLE_PASSIVE",
+    "ROLE_ALERTS", "ROLE_APPROVALS", "ROLE_OPS", "ORIGIN_FIRST", "LEGACY",
     "ACTIONABLE_KINDS", "DEFAULT_ORIGIN_STALE_SECONDS", "routing_mode", "origin_stale_seconds",
-    "is_actionable", "sub_role", "describe_origin", "strip_route_metadata", "fallback_prefix",
+    "is_actionable", "event_topic_role", "sub_role", "describe_origin", "strip_route_metadata",
+    "fallback_prefix", "topic_prefix",
 ]
 
 LEGACY = "legacy"
@@ -87,6 +92,20 @@ def is_actionable(ev: Any) -> bool:
     return kind in ACTIONABLE_KINDS
 
 
+def event_topic_role(ev: Any) -> Optional[str]:
+    """Dedicated Ops topic for an actionable event with a non-Telegram origin."""
+    payload = getattr(ev, "payload", None) or {}
+    if ev.kind in {"gave_up", "block_loop_detected"}:
+        return ROLE_ALERTS
+    if ev.kind == "blocked":
+        kind = payload.get("kind")
+        if kind == "needs_input":
+            return ROLE_APPROVALS
+        if kind in {"capability", "transient"}:
+            return ROLE_ALERTS
+    return None
+
+
 def _meta(sub: dict) -> dict:
     meta = sub.get("delivery_metadata")
     return meta if isinstance(meta, dict) else {}
@@ -94,7 +113,9 @@ def _meta(sub: dict) -> dict:
 
 def _stamped_role(sub: dict) -> Optional[str]:
     role = _meta(sub).get(ROUTE_ROLE_KEY)
-    return role if role in (ROLE_ORIGIN, ROLE_MIRROR, ROLE_FALLBACK) else None
+    return role if role in (
+        ROLE_ORIGIN, ROLE_MIRROR, ROLE_FALLBACK, ROLE_ALERTS, ROLE_APPROVALS, ROLE_OPS,
+    ) else None
 
 
 # Not persisted: an unstamped, metadata-less row (CLI/cron-written, e.g. the home-DM
@@ -139,6 +160,11 @@ def strip_route_metadata(metadata: dict) -> dict:
 def fallback_prefix(sub: dict) -> str:
     origin = _meta(sub).get(ROUTE_ORIGIN_KEY)
     return f"↪ Fallback — origin unreachable ({origin}). " if origin else "↪ Fallback — origin unreachable. "
+
+
+def topic_prefix(sub: dict) -> str:
+    origin = _meta(sub).get(ROUTE_ORIGIN_KEY)
+    return f"Origin: {origin}. " if origin else ""
 
 
 def stale_window(cfg: Any, now: Optional[float] = None) -> tuple[int, int]:

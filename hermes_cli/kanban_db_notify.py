@@ -37,6 +37,7 @@ ROUTE_ROLE_KEY = "route_role"
 ROUTE_FAILURES_KEY = "route_failures"
 ROUTE_ORIGIN_KEY = "route_origin"
 ROLE_ORIGIN, ROLE_MIRROR, ROLE_FALLBACK = "origin", "mirror", "fallback"
+ROLE_ALERTS, ROLE_APPROVALS, ROLE_OPS = "alerts", "approvals", "ops"
 
 # Subscription primary key predicate; every per-row statement below binds
 # ``(task_id, platform, chat_id, thread_id or "")`` against it.
@@ -536,6 +537,54 @@ def ensure_fallback_notify_sub(
                 "last_event_id = ? " + _SUB_KEY_WHERE,
                 (metadata_json, start, *key),
             )
+    return True
+
+
+def ensure_topic_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    role: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    start_cursor: int,
+    origin: str,
+) -> bool:
+    """Create one durable notify-only Ops-topic route for ``task_id``/``role``.
+
+    The role is the dedup identity, while the subscription primary key remains
+    the physical Telegram destination. Existing rows are never repurposed: in
+    particular, a fallback already occupying Alerts remains the task's single
+    alert route. New rows begin immediately before the event that selected the
+    route, so activation cannot replay older card history.
+    """
+    if role not in (ROLE_ALERTS, ROLE_APPROVALS, ROLE_OPS):
+        raise ValueError(f"unsupported topic route role: {role}")
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    start = int(start_cursor)
+    with _kb.write_txn(conn):
+        rows = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,)).fetchall()
+        for row in rows:
+            meta = _decode_notify_delivery_metadata(row["delivery_metadata"])
+            if meta.get(ROUTE_ROLE_KEY) == role:
+                return False
+            if (row["platform"], row["chat_id"], row["thread_id"] or "") == key[1:]:
+                return False
+        metadata_json = _encode_notify_delivery_metadata({
+            ROUTE_ROLE_KEY: role,
+            ROUTE_ORIGIN_KEY: str(origin)[:200],
+        })
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, chat_type, notifier_profile,
+                 delivery_mode, delivery_metadata, created_at, last_event_id, last_ping_event_id)
+            VALUES (?, ?, ?, ?, 'group', ?, 'notify', ?, ?, ?, ?)
+            """,
+            (*key, notifier_profile, metadata_json, int(time.time()), start, start),
+        )
     return True
 
 

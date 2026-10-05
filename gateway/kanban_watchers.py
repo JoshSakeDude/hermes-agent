@@ -79,6 +79,8 @@ class GatewayKanbanWatchersMixin:
         from gateway import kanban_notify_routing as _routing
         self._kanban_notify_routing = _routing.routing_mode({"kanban": kanban_cfg})
         self._kanban_origin_stale_seconds = _routing.origin_stale_seconds({"kanban": kanban_cfg})
+        if not hasattr(self, "_kanban_notify_started_at"):
+            self._kanban_notify_started_at = int(time.time())
         if not kanban_cfg.get("notify_in_gateway", True):
             logger.info("kanban notifier: disabled via config kanban.notify_in_gateway=false")
             return

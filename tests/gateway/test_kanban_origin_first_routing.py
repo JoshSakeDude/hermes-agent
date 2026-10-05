@@ -6,12 +6,13 @@ Policy under test:
   (no blanket Telegram mirroring of Desktop-origin cards);
 - origin delivery failures rewind and retry; after a bounded number of consecutive failures
   (or a Desktop origin leaving an actionable event unclaimed past the staleness window) exactly
-  one notify-only Telegram fallback row is created on the home channel;
+  one notify-only Telegram fallback row is created in the Gohan Ops Alerts topic;
 - the fallback never wakes a conversation and carries the card/origin identity;
 - internal / non-actionable lifecycle events never reach Josh.
 """
 
 import asyncio
+import json
 
 import pytest
 
@@ -26,6 +27,8 @@ from tui_gateway.server import _collect_kanban_notifications
 HOME_CHAT = "home-chat"
 ORIGIN_CHAT = "origin-chat"
 DESKTOP_KEY = "desktop-session-key-1"
+OPS_CHAT = "ops-forum"
+TOPICS = {"tasks": "11", "approvals": "12", "ops": "13", "alerts": "14"}
 
 
 class RecordingAdapter:
@@ -49,6 +52,9 @@ class RecordingAdapter:
 def _make_runner(adapter, *, home=True):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
+    # Every test DB is fresh. Pin the process-start guard before its first event
+    # so headless-route tests cannot race an integer-second boundary.
+    runner._kanban_notify_started_at = 0
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
     runner._kanban_dispatcher_lock_handle = object()
@@ -81,6 +87,11 @@ def _tick(monkeypatch, runner, n=1):
 @pytest.fixture
 def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "origin-first.db"))
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    (hermes_home / "telegram_topics.json").write_text(
+        json.dumps({"chat_id": OPS_CHAT, "topics": TOPICS}), encoding="utf-8")
     kb.init_db()
     # The watcher reads the live config once; pin the mode under test instead.
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {"notification_routing": "origin_first"}})
@@ -156,6 +167,14 @@ def _fallback_rows(tid):
     return [s for s in _subs(tid) if (s.get("delivery_metadata") or {}).get(ROUTE_ROLE_KEY) == "fallback"]
 
 
+def _topic_rows(tid, role):
+    return [s for s in _subs(tid) if (s.get("delivery_metadata") or {}).get(ROUTE_ROLE_KEY) == role]
+
+
+def _sent_destinations(adapter):
+    return [(s["chat_id"], s["metadata"].get("thread_id")) for s in adapter.sent]
+
+
 # --- Desktop origin ---------------------------------------------------------
 
 
@@ -216,7 +235,8 @@ def test_stale_desktop_origin_creates_one_notify_only_fallback(board, monkeypatc
 
     fallbacks = _fallback_rows(tid)
     assert len(fallbacks) == 1
-    assert fallbacks[0]["platform"] == "telegram" and fallbacks[0]["chat_id"] == HOME_CHAT
+    assert fallbacks[0]["platform"] == "telegram" and fallbacks[0]["chat_id"] == OPS_CHAT
+    assert fallbacks[0]["thread_id"] == TOPICS["alerts"]
     assert fallbacks[0]["delivery_mode"] == "notify"
     assert len(adapter.sent) == 1
     text = adapter.sent[0]["text"]
@@ -261,8 +281,8 @@ def test_existing_notify_wake_mirror_converts_to_fallback_that_never_wakes(board
     assert adapter.handled == []
 
 
-def test_originless_passive_cron_row_pings_but_never_wakes(board, monkeypatch):
-    """A bare cron-written notify+wake row is visibility, not an origin conversation."""
+def test_originless_passive_cron_row_routes_to_ops_and_never_wakes_fred(board, monkeypatch):
+    """A bare cron-written Fred row is a silent mirror; headless work routes to Ops."""
     tid = _task(title="headless cron card")
     _blanket_mirror(tid)  # no routing metadata: ROLE_PASSIVE when no origin exists
     _event(tid, "blocked", {"reason": "needs Josh", "kind": "needs_input"})
@@ -270,9 +290,84 @@ def test_originless_passive_cron_row_pings_but_never_wakes(board, monkeypatch):
     adapter = RecordingAdapter()
     _tick(monkeypatch, _make_runner(adapter), n=2)
 
-    assert len(adapter.sent) == 1
+    assert _sent_destinations(adapter) == [(OPS_CHAT, TOPICS["ops"])]
     assert tid in adapter.sent[0]["text"]
     assert adapter.handled == []
+    assert HOME_CHAT not in [s["chat_id"] for s in adapter.sent]
+
+
+@pytest.mark.parametrize("kind,payload", [
+    ("gave_up", {"failures": 2, "error": "boom"}),
+    ("block_loop_detected", {"kind": "transient", "reason": "again"}),
+    ("blocked", {"kind": "capability", "reason": "no access"}),
+    ("blocked", {"kind": "transient", "reason": "network"}),
+])
+def test_desktop_origin_failures_route_once_to_alerts_never_fred(board, monkeypatch, kind, payload):
+    tid = _task(title="desktop failure")
+    _desktop_origin(tid)
+    _blanket_mirror(tid)
+    _event(tid, kind, payload)
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=3)
+
+    assert _sent_destinations(adapter) == [(OPS_CHAT, TOPICS["alerts"])]
+    assert len(_topic_rows(tid, "alerts")) == 1
+    assert tid in adapter.sent[0]["text"] and "tui" in adapter.sent[0]["text"]
+    assert adapter.handled == []
+
+
+def test_desktop_origin_needs_input_routes_once_to_approvals_never_fred(board, monkeypatch):
+    tid = _task(title="desktop decision")
+    _desktop_origin(tid)
+    _blanket_mirror(tid)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "pick one"})
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=3)
+
+    assert _sent_destinations(adapter) == [(OPS_CHAT, TOPICS["approvals"])]
+    assert len(_topic_rows(tid, "approvals")) == 1
+    assert tid in adapter.sent[0]["text"] and "tui" in adapter.sent[0]["text"]
+    assert adapter.handled == []
+
+
+def test_telegram_origin_failure_has_no_duplicate_alert_notice(board, monkeypatch):
+    tid = _task(session_id="agent:main:telegram:dm:origin-chat")
+    _sub(tid, platform="telegram", chat_id=ORIGIN_CHAT, user_id=ORIGIN_CHAT, chat_type="dm",
+         notifier_profile="default", delivery_mode="notify+wake",
+         delivery_metadata=_origin_meta(chat_type="dm"))
+    _event(tid, "gave_up", {"failures": 2, "error": "boom"})
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert [s["chat_id"] for s in adapter.sent] == [ORIGIN_CHAT]
+    assert _topic_rows(tid, "alerts") == []
+
+
+def test_originless_completed_routes_to_ops_not_fred(board, monkeypatch):
+    tid = _task(title="headless complete")
+    _blanket_mirror(tid)
+    _complete(tid)
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert _sent_destinations(adapter) == [(OPS_CHAT, TOPICS["ops"])]
+    assert len(_topic_rows(tid, "ops")) == 1
+    assert adapter.handled == []
+
+
+def test_originless_card_without_any_subscription_routes_to_ops(board, monkeypatch):
+    tid = _task(title="cli card")
+    _complete(tid)
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert _sent_destinations(adapter) == [(OPS_CHAT, TOPICS["ops"])]
+    assert len(_topic_rows(tid, "ops")) == 1
 
 
 # --- Telegram origins -------------------------------------------------------
@@ -357,8 +452,9 @@ def test_permanent_origin_failure_creates_single_fallback(board, monkeypatch):
 
     _tick(monkeypatch, runner, n=4)
     fallbacks = _fallback_rows(tid)
-    assert len(fallbacks) == 1 and fallbacks[0]["chat_id"] == HOME_CHAT
-    assert [s["chat_id"] for s in adapter.sent] == [HOME_CHAT]
+    assert len(fallbacks) == 1 and fallbacks[0]["chat_id"] == OPS_CHAT
+    assert fallbacks[0]["thread_id"] == TOPICS["alerts"]
+    assert [s["chat_id"] for s in adapter.sent] == [OPS_CHAT]
     text = adapter.sent[0]["text"]
     assert tid in text and "topic card" in text and ORIGIN_CHAT in text
     assert adapter.handled == []
@@ -412,7 +508,7 @@ def test_later_desktop_stale_scan_does_not_rewind_or_redeliver_fallback(board, m
     tid = _task(title="stale scan dedup")
     _desktop_origin(tid)
     _blanket_mirror(tid)
-    _event(tid, "blocked", {"reason": "needs Josh", "kind": "needs_input"})
+    _complete(tid)
     _age_events(tid, 3600)
 
     adapter = RecordingAdapter()
@@ -446,7 +542,7 @@ def test_fallback_is_deduplicated_across_ticks_and_events(board, monkeypatch):
     tid = _task()
     _desktop_origin(tid)
     _blanket_mirror(tid)
-    _event(tid, "blocked", {"reason": "needs Josh", "kind": "needs_input"})
+    _complete(tid, summary="first")
     _age_events(tid, 3600)
 
     adapter = RecordingAdapter()
@@ -455,7 +551,7 @@ def test_fallback_is_deduplicated_across_ticks_and_events(board, monkeypatch):
     assert len(_fallback_rows(tid)) == 1
     assert len(adapter.sent) == 1
 
-    _complete(tid)
+    _event(tid, "status", {"status": "blocked"})
     _age_events(tid, 3600)
     _tick(monkeypatch, runner, n=3)
     assert len(_fallback_rows(tid)) == 1
@@ -463,15 +559,19 @@ def test_fallback_is_deduplicated_across_ticks_and_events(board, monkeypatch):
     assert adapter.handled == []
 
 
-def test_no_home_channel_never_invents_a_fallback(board, monkeypatch):
+def test_missing_topic_map_warns_and_never_invents_dm_fallback(board, monkeypatch, caplog):
+    from hermes_constants import get_default_hermes_root
+
+    (get_default_hermes_root() / "telegram_topics.json").unlink()
     tid = _task()
     _desktop_origin(tid)
     _complete(tid)
     _age_events(tid, 3600)
 
     adapter = RecordingAdapter()
-    _tick(monkeypatch, _make_runner(adapter, home=False), n=2)
+    _tick(monkeypatch, _make_runner(adapter), n=2)
     assert adapter.sent == [] and _fallback_rows(tid) == []
+    assert "telegram topic map" in caplog.text.lower()
 
 
 # --- Internal event silence -------------------------------------------------
