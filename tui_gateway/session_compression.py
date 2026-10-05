@@ -207,7 +207,16 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
         # The picker optimistically displays a queued model. Repaint it from the live agent before
         # explaining why the queued switch was refused; a generic error alone leaves stale UI state.
         _emit_session_info(sid, session)
-        _emit("notice", sid, {"message": f"model switch to {target} not applied: {reason}"})
+        _emit(
+            "notification.show",
+            sid,
+            {
+                "text": f"model switch to {target} not applied: {reason}",
+                "level": "warn",
+                "kind": "ttl",
+                "key": f"model_switch.not_applied:{sid}",
+            },
+        )
 
     try:
         result = _apply_model_switch(sid, session, pending["raw"], confirm_expensive_model=bool(pending.get("confirm_expensive_model")))

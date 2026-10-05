@@ -225,8 +225,16 @@ class TestTurnStartRefusalIsVisible:
         assert emitted[0] == (
             "session.info", "sid", {"model": "old-model", "provider": "old-provider"}
         )
-        assert emitted[1][0] == "notice"
-        assert f"model switch to new-model not applied: {reason}" in emitted[1][2]["message"]
+        assert emitted[1] == (
+            "notification.show",
+            "sid",
+            {
+                "text": f"model switch to new-model not applied: {reason}",
+                "level": "warn",
+                "kind": "ttl",
+                "key": "model_switch.not_applied:sid",
+            },
+        )
         assert not any(event == "error" for event, _sid, _payload in emitted)
 
 class TestGuardFailureIsNotFatal:
