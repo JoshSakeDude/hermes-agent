@@ -201,14 +201,23 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
     pending = session.pop("pending_model_switch", None)
     if not pending or session.get("agent") is None:
         return
+    target = pending.get("display_model") or pending.get("raw") or "requested model"
+
+    def _not_applied(reason: str) -> None:
+        # The picker optimistically displays a queued model. Repaint it from the live agent before
+        # explaining why the queued switch was refused; a generic error alone leaves stale UI state.
+        _emit_session_info(sid, session)
+        _emit("notice", sid, {"message": f"model switch to {target} not applied: {reason}"})
+
     try:
         result = _apply_model_switch(sid, session, pending["raw"], confirm_expensive_model=bool(pending.get("confirm_expensive_model")))
         # Honour the expensive-model confirm: surface the warning and drop the switch rather than spend
         # on a model the user never confirmed.
         if result.get("confirm_required"):
-            _emit("error", sid, {"message": result.get("confirm_message") or result.get("warning") or ""})
+            _not_applied(
+                result.get("confirm_message") or result.get("warning") or "confirmation required")
     except Exception as e:
-        _emit("error", sid, {"message": f"Could not switch model: {e}"})
+        _not_applied(str(e))
 
 
 class CompressionLockHeld(Exception):

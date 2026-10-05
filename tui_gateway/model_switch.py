@@ -483,7 +483,7 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
             platform="tui", user_config=getattr(session.get("agent"), "_notification_config", None))
 
 
-def _pending_switch_selection_warning(model: str, provider: str) -> str | None:
+def _pending_switch_selection_warning(model: str, provider: str, selection_context=None) -> str | None:
     """Selection-guard message for a model queued mid-turn, or ``None``. Runs BEFORE the pick is
     stashed (the client can still turn the response into a confirm prompt); only pre-resolution
     inputs exist so it can only under-fire — ``_apply_model_switch`` is the backstop."""
@@ -491,7 +491,8 @@ def _pending_switch_selection_warning(model: str, provider: str) -> str | None:
         return None
     try:
         from hermes_cli.model_selection_guards import combined_selection_warning
-        warning = combined_selection_warning(model, provider=provider or None)
+        warning = combined_selection_warning(
+            model, provider=provider or None, selection_context=selection_context)
     except Exception:
         return None
     return warning.message if warning is not None else None

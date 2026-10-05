@@ -27,6 +27,7 @@ from tui_gateway import server
 # the stash branch can see before resolution.
 GUARDED_MODEL = "muse-spark-1.2-contributor"
 UNGUARDED_MODEL = "anthropic/claude-sonnet-4.6"
+LARGE_CONTEXT_TARGET = "anthropic/claude-haiku-4.5"
 
 def _session(**extra):
     return {
@@ -63,6 +64,25 @@ def running_session(monkeypatch):
 
     monkeypatch.setattr(server, "_apply_model_switch", _must_not_run)
     server._sessions["sid"] = _session(running=True)
+    try:
+        yield server._sessions["sid"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.fixture
+def running_large_context_session(monkeypatch):
+    """A busy session with enough measured context to trigger the cache-cost guard."""
+
+    agent = types.SimpleNamespace(
+        model="anthropic/claude-sonnet-4.6",
+        provider="anthropic",
+        context_compressor=types.SimpleNamespace(last_prompt_tokens=225_000),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_selection_guards._context_cache_threshold", lambda: 100_000
+    )
+    server._sessions["sid"] = _session(running=True, agent=agent)
     try:
         yield server._sessions["sid"]
     finally:
@@ -127,6 +147,87 @@ class TestUnguardedPickStillDefers:
 
         pending = running_session["pending_model_switch"]
         assert pending["display_provider"] == "anthropic"
+
+
+class TestLargeContextPickAsksBeforeStashing:
+    def test_reports_confirm_required_with_live_context(self, running_large_context_session):
+        result = _config_set_model(LARGE_CONTEXT_TARGET)["result"]
+
+        assert result["confirm_required"] is True
+        assert result["deferred"] is False
+        assert "225,000 tokens" in result["confirm_message"]
+        assert "pending_model_switch" not in running_large_context_session
+
+    def test_confirmed_pick_commits_at_next_turn_start(
+        self, running_large_context_session, monkeypatch
+    ):
+        result = _config_set_model(
+            LARGE_CONTEXT_TARGET, confirm_expensive_model=True
+        )["result"]
+        assert result["deferred"] is True
+        assert running_large_context_session["pending_model_switch"][
+            "confirm_expensive_model"
+        ] is True
+
+        applied = []
+
+        def _apply(sid, session, raw, **kwargs):
+            applied.append((sid, raw, kwargs["confirm_expensive_model"]))
+            session["agent"].model = LARGE_CONTEXT_TARGET
+            return {"value": LARGE_CONTEXT_TARGET, "confirm_required": False, "warning": ""}
+
+        monkeypatch.setattr(server, "_apply_model_switch", _apply)
+        running_large_context_session["running"] = False
+        server._apply_pending_model_switch("sid", running_large_context_session)
+
+        assert applied == [("sid", LARGE_CONTEXT_TARGET, True)]
+        assert running_large_context_session["agent"].model == LARGE_CONTEXT_TARGET
+        assert "pending_model_switch" not in running_large_context_session
+
+
+class TestTurnStartRefusalIsVisible:
+    @pytest.mark.parametrize(
+        ("result", "raised", "reason"),
+        [
+            ({"confirm_required": True, "confirm_message": "confirmation required"}, None,
+             "confirmation required"),
+            (None, RuntimeError("resolver unavailable"), "resolver unavailable"),
+        ],
+    )
+    def test_repaints_real_model_and_emits_specific_notice(
+        self, monkeypatch, result, raised, reason
+    ):
+        agent = types.SimpleNamespace(model="old-model", provider="old-provider")
+        session = _session(agent=agent, pending_model_switch={
+            "raw": "new-model --provider new-provider",
+            "display_model": "new-model",
+            "display_provider": "new-provider",
+            "confirm_expensive_model": False,
+        })
+        emitted = []
+
+        def _apply(*_args, **_kwargs):
+            if raised is not None:
+                raise raised
+            return result
+
+        monkeypatch.setattr(server, "_apply_model_switch", _apply)
+        monkeypatch.setattr(
+            server, "_session_info",
+            lambda live_agent, _session: {"model": live_agent.model, "provider": live_agent.provider},
+        )
+        monkeypatch.setattr(
+            server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload))
+        )
+
+        server._apply_pending_model_switch("sid", session)
+
+        assert emitted[0] == (
+            "session.info", "sid", {"model": "old-model", "provider": "old-provider"}
+        )
+        assert emitted[1][0] == "notice"
+        assert f"model switch to new-model not applied: {reason}" in emitted[1][2]["message"]
+        assert not any(event == "error" for event, _sid, _payload in emitted)
 
 class TestGuardFailureIsNotFatal:
     def test_a_raising_guard_falls_back_to_deferring(self, running_session, monkeypatch):
