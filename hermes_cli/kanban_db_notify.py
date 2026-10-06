@@ -38,6 +38,7 @@ ROUTE_FAILURES_KEY = "route_failures"
 ROUTE_ORIGIN_KEY = "route_origin"
 ROLE_ORIGIN, ROLE_MIRROR, ROLE_FALLBACK = "origin", "mirror", "fallback"
 ROLE_ALERTS, ROLE_APPROVALS, ROLE_OPS = "alerts", "approvals", "ops"
+FALLBACK_SENT_EVENT = "fallback_sent"
 
 # Subscription primary key predicate; every per-row statement below binds
 # ``(task_id, platform, chat_id, thread_id or "")`` against it.
@@ -512,6 +513,12 @@ def ensure_fallback_notify_sub(
     key = _sub_key(task_id, platform, chat_id, thread_id)
     start = int(start_cursor)
     with _kb.write_txn(conn):
+        sent = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, FALLBACK_SENT_EVENT),
+        ).fetchone()
+        if sent is not None:
+            return False
         rows = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,)).fetchall()
         if any(_decode_notify_delivery_metadata(r["delivery_metadata"]).get(ROUTE_ROLE_KEY) == ROLE_FALLBACK
                for r in rows):
@@ -537,6 +544,30 @@ def ensure_fallback_notify_sub(
                 "last_event_id = ? " + _SUB_KEY_WHERE,
                 (metadata_json, start, *key),
             )
+    return True
+
+
+def record_fallback_sent(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Persist the one-shot fallback delivery marker independently of its subscription row."""
+    with _kb.write_txn(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, FALLBACK_SENT_EVENT),
+        ).fetchone()
+        if existing is not None:
+            return False
+        _kb._append_event(conn, task_id, FALLBACK_SENT_EVENT, {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id or "",
+        })
     return True
 
 

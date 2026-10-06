@@ -417,6 +417,9 @@ class _Collector:
         for sub in kbn.list_notify_subs(conn):
             by_task.setdefault(sub["task_id"], []).append(sub)
         for task_id, siblings in by_task.items():
+            task = self.kb.get_task(conn, task_id)
+            if task is None or task.status == "archived":
+                continue
             classified = [(sub, _routing.sub_role(sub, siblings)) for sub in siblings]
             origins = [sub for sub, role in classified if role == _routing.ROLE_ORIGIN]
             if any((sub.get("platform") or "").lower() == "telegram" for sub in origins):
@@ -461,8 +464,9 @@ class _Collector:
         # Only consider events created since this notifier process started, so
         # enabling origin-first cannot replay the board's historical backlog.
         rows = conn.execute(
-            "SELECT e.* FROM task_events e "
-            "WHERE e.created_at >= ? AND e.kind IN (" + ",".join("?" * len(TERMINAL_KINDS)) + ") "
+            "SELECT e.* FROM task_events e JOIN tasks t ON t.id = e.task_id "
+            "WHERE t.status != 'archived' AND e.created_at >= ? "
+            "AND e.kind IN (" + ",".join("?" * len(TERMINAL_KINDS)) + ") "
             "AND NOT EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = e.task_id) "
             "ORDER BY e.id ASC",
             (self.started_at, *TERMINAL_KINDS),
@@ -496,6 +500,9 @@ class _Collector:
                 conn, platform="tui", kinds=_routing.ACTIONABLE_KINDS, min_created_at=lo, max_created_at=hi):
             tid = desk["task_id"]
             if tid in seen or not _routing.is_actionable(ev):
+                continue
+            task = self.kb.get_task(conn, tid)
+            if task is None or task.status == "archived":
                 continue
             if _routing.event_topic_role(ev):
                 continue  # already handled by the dedicated Alerts/Approvals route
@@ -1086,7 +1093,11 @@ class _KanbanNotification:
                 )
                 return
 
-        # Delivery complete: advance the cursor (the dedup mechanism).
+        # Delivery complete: persist fallback dedup before the subscription can
+        # be removed, then advance the cursor.
+        if self.role == _routing.ROLE_FALLBACK:
+            await _to_thread_process_service(partial(
+                self.runner._kanban_sub_op, self.board_slug, "record_fallback_sent", self.sub))
         await self.advance()
         if self.role == _routing.ROLE_ORIGIN and (self.sub.get("delivery_metadata") or {}).get(
                 _kbn().ROUTE_FAILURES_KEY):

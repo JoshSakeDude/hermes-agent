@@ -138,6 +138,14 @@ def _complete(tid, summary="shipped"):
         conn.close()
 
 
+def _archive(tid):
+    conn = kbc.connect()
+    try:
+        assert kb.archive_task(conn, tid)
+    finally:
+        conn.close()
+
+
 def _event(tid, kind, payload=None):
     conn = kbc.connect()
     try:
@@ -245,6 +253,22 @@ def test_stale_desktop_origin_creates_one_notify_only_fallback(board, monkeypatc
     assert "tui" in text and DESKTOP_KEY in text  # original card/session identity
     assert ROUTE_ROLE_KEY not in adapter.sent[0]["metadata"]
     assert adapter.handled == []  # fallback never wakes a conversation
+
+
+def test_archived_stale_desktop_origin_never_loops_fallback(board, monkeypatch):
+    """An archived card cannot recreate its fallback after archive delivery removes that row."""
+    tid = _task(title="archived desktop card")
+    _desktop_origin(tid)
+    _complete(tid)
+    _archive(tid)
+    _age_events(tid, 3600)
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=4)
+
+    assert len(adapter.sent) <= 1
+    assert adapter.handled == []
+    assert _subs(tid) == []
 
 
 def test_existing_notify_wake_mirror_converts_to_fallback_that_never_wakes(board, monkeypatch):
@@ -548,6 +572,35 @@ def test_ensure_fallback_second_call_is_noop_and_preserves_progress(board):
     assert after["last_event_id"] == event_id
     assert after["last_ping_event_id"] == event_id
     assert after["delivery_metadata"] == before["delivery_metadata"]
+
+
+def test_fallback_sent_marker_deduplicates_after_row_deletion(board):
+    tid = _task()
+    conn = kbc.connect()
+    try:
+        assert kbn.ensure_fallback_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=OPS_CHAT,
+            thread_id=TOPICS["alerts"], notifier_profile="default",
+            start_cursor=0, origin=f"tui:{DESKTOP_KEY}",
+        ) is True
+        assert kbn.record_fallback_sent(
+            conn, task_id=tid, platform="telegram", chat_id=OPS_CHAT,
+            thread_id=TOPICS["alerts"],
+        ) is True
+        assert kbn.remove_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=OPS_CHAT,
+            thread_id=TOPICS["alerts"],
+        ) is True
+
+        assert kbn.ensure_fallback_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id=OPS_CHAT,
+            thread_id=TOPICS["alerts"], notifier_profile="default",
+            start_cursor=0, origin=f"tui:{DESKTOP_KEY}",
+        ) is False
+    finally:
+        conn.close()
+
+    assert _fallback_rows(tid) == []
 
 
 def test_later_desktop_stale_scan_does_not_rewind_or_redeliver_fallback(board, monkeypatch):
