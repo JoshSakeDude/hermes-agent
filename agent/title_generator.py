@@ -50,6 +50,8 @@ _PASTE_PREVIEW_LABEL = "\n\nPasted content:\n"
 _ATTACHMENT_REF_RE = re.compile(r"@(?:file|folder):\S+")
 # Footers the @-reference expander appends below the typed text (agent/context_references.py).
 _CONTEXT_FOOTER_RE = re.compile(r"\n+--- (?:Context Warnings|Attached Context) ---\n.*", re.DOTALL)
+# A Markdown code-fence delimiter, optionally followed by a language identifier.
+_FENCE_LINE_RE = re.compile(r"^\s*(?:`{3,}|~{3,})\s*[\w#+.-]*\s*$")
 # Cap on the instant derived title; a raw fragment reads worse the longer it runs.
 MAX_DERIVED_TITLE_CHARS = 48
 # Answer-shaped guard: a tiny model sometimes answers instead of titling; longer is rejected, not truncated.
@@ -341,12 +343,22 @@ def is_titleable_user_message(user_message: str) -> bool:
 
 
 def derive_title(user_message: str, title_preview: str | None = None) -> Optional[str]:
-    """Instant title: first meaningful line trimmed to a word boundary. No model, never fails."""
+    """Instant title: first meaningful non-fence line. No model, never fails."""
     # Attachment-only opener, no paste preview: a file drop has no topic —
     # refuse rather than name the session after the truncated path (#92068).
     if not title_preview and _attachment_only_opener(user_message):
         return None
-    line = " ".join(_first_line(build_title_input(user_message, title_preview)).split())
+    title_input = build_title_input(user_message, title_preview)
+    line = " ".join(
+        next(
+            (
+                candidate.strip()
+                for candidate in title_input.splitlines()
+                if candidate.strip() and not _FENCE_LINE_RE.match(candidate)
+            ),
+            "",
+        ).split()
+    )
     if len(line) > MAX_DERIVED_TITLE_CHARS:
         cut = line[:MAX_DERIVED_TITLE_CHARS]
         space = cut.rfind(" ")
