@@ -402,6 +402,9 @@ class GatewaySlashCommandsMixin(
             from hermes_cli import kanban_db_notify as _kbn
             conn = _kbc.connect(board=requested_board)
             try:
+                meta = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
+                if not _kbn.list_notify_subs(conn, task_id):
+                    meta[_kbn.ROUTE_ROLE_KEY] = _kbn.ROLE_ORIGIN  # origin-first routing: creator is origin
                 _kbn.add_notify_sub(
                     conn, task_id=task_id, platform=platform_str, chat_id=chat_id, chat_type=chat_type,
                     thread_id=_field("thread_id"), user_id=_field("user_id"),
@@ -411,7 +414,7 @@ class GatewaySlashCommandsMixin(
                     user_id_alt=_field("user_id_alt"),
                     notifier_profile=_field("profile") or getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                     # Subscribing from chat: deliver the passive message and wake the destination agent.
-                    delivery_mode="notify+wake", delivery_metadata=delivery_metadata)
+                    delivery_mode="notify+wake", delivery_metadata=meta or None)
             finally:
                 conn.close()
         await asyncio.to_thread(_sub)

@@ -1244,10 +1244,16 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
         # Auto-subscribe must not turn a passive destination into an agent wake.
+        existing = _kbn.list_notify_subs(conn, task_id)
         if any(sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
-               for sub in _kbn.list_notify_subs(conn, task_id)):
+               for sub in existing):
             return True
+        if not existing:
+            # The creating conversation is the card's origin (origin-first routing). Inherited
+            # parent rows already carry their own role, so only a first subscriber is stamped.
+            target = {**target, "delivery_metadata": {
+                **(target.get("delivery_metadata") or {}), _kbn.ROUTE_ROLE_KEY: _kbn.ROLE_ORIGIN}}
         _kbn.add_notify_sub(conn, task_id=task_id, **target)
         return True
     except Exception as _exc:

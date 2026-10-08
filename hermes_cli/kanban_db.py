@@ -1419,6 +1419,7 @@ def _inherit_notify_subs(
                COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
+           AND COALESCE(delivery_metadata, '') NOT LIKE '%"route_role":"fallback"%'
         """,
         (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
     )
@@ -3844,6 +3845,13 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        # Desktop routes are pull-based. Once a card is archived they can never
+        # legitimately deliver again, and retaining an unread origin row lets
+        # the gateway's stale-origin scan recreate notification fallbacks.
+        conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ? AND LOWER(platform) = 'tui'",
+            (task_id,),
+        )
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):

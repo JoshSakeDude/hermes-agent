@@ -657,6 +657,8 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": "462",
         "thread_id": "20197",
+        # The creating conversation is stamped as the card's origin (origin-first routing).
+        "route_role": "origin",
     }
 
     conn = kbc.connect(board="default")

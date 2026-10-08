@@ -27,6 +27,19 @@ _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
 
 _SCALAR_TYPES = (str, int, float, bool)
 
+# Origin-first routing markers persisted inside ``delivery_metadata`` (no schema
+# change). ``route_*`` keys are internal bookkeeping and are stripped before any
+# adapter send. ``route_role``: "origin" (the exact conversation that created the
+# card), "fallback" (the single notify-only home-channel row created after the
+# origin is permanently unreachable) or "mirror"; unstamped rows are classified
+# by ``gateway.kanban_notify_routing.sub_role``.
+ROUTE_ROLE_KEY = "route_role"
+ROUTE_FAILURES_KEY = "route_failures"
+ROUTE_ORIGIN_KEY = "route_origin"
+ROLE_ORIGIN, ROLE_MIRROR, ROLE_FALLBACK = "origin", "mirror", "fallback"
+ROLE_ALERTS, ROLE_APPROVALS, ROLE_OPS = "alerts", "approvals", "ops"
+FALLBACK_SENT_EVENT = "fallback_sent"
+
 # Subscription primary key predicate; every per-row statement below binds
 # ``(task_id, platform, chat_id, thread_id or "")`` against it.
 _SUB_KEY_WHERE = "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
@@ -433,6 +446,218 @@ def rewind_notify_cursor(
     """
     with _kb.write_txn(conn):
         cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), old_cursor, claimed_cursor)
+    return cur.rowcount > 0
+
+
+def _update_route_metadata(conn: sqlite3.Connection, key: tuple, mutate) -> Optional[dict[str, Any]]:
+    row = conn.execute("SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
+    if row is None:
+        return None
+    meta = _decode_notify_delivery_metadata(row["delivery_metadata"])
+    mutate(meta)
+    conn.execute(
+        "UPDATE kanban_notify_subs SET delivery_metadata = ? " + _SUB_KEY_WHERE,
+        (_encode_notify_delivery_metadata(meta), *key),
+    )
+    return meta
+
+
+def bump_route_failures(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str, thread_id: Optional[str] = None,
+) -> int:
+    """Durably count one more consecutive origin-delivery failure; returns the new count (0 if unsubscribed).
+
+    Durable (not the notifier's in-memory map) so a gateway restart cannot reset the
+    bounded-retry budget and postpone the fallback forever.
+    """
+    def mutate(meta: dict[str, Any]) -> None:
+        try:
+            meta[ROUTE_FAILURES_KEY] = int(meta.get(ROUTE_FAILURES_KEY) or 0) + 1
+        except (TypeError, ValueError):
+            meta[ROUTE_FAILURES_KEY] = 1
+    with _kb.write_txn(conn):
+        meta = _update_route_metadata(conn, _sub_key(task_id, platform, chat_id, thread_id), mutate)
+    return int(meta[ROUTE_FAILURES_KEY]) if meta else 0
+
+
+def clear_route_failures(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str, thread_id: Optional[str] = None,
+) -> None:
+    with _kb.write_txn(conn):
+        _update_route_metadata(conn, _sub_key(task_id, platform, chat_id, thread_id),
+                               lambda meta: meta.pop(ROUTE_FAILURES_KEY, None))
+
+
+def ensure_fallback_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    start_cursor: int,
+    origin: str,
+) -> bool:
+    """Create the task's single notify-only fallback row; False when one already exists.
+
+    Dedup is per task, inside one write transaction: a task never gets a second
+    fallback, whatever destination or how many ticks/events. When the destination
+    already holds a (silent mirror) row for the same key, that row is converted in
+    place — its cursor is moved to ``start_cursor`` so the first unacknowledged
+    actionable event is delivered, and its mode is forced to ``notify`` so the
+    fallback never wakes a conversation. ``origin`` (``platform:chat[:thread]``) is
+    recorded so the ping names the conversation that could not be reached.
+    """
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    start = int(start_cursor)
+    with _kb.write_txn(conn):
+        sent = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, FALLBACK_SENT_EVENT),
+        ).fetchone()
+        if sent is not None:
+            return False
+        rows = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,)).fetchall()
+        if any(_decode_notify_delivery_metadata(r["delivery_metadata"]).get(ROUTE_ROLE_KEY) == ROLE_FALLBACK
+               for r in rows):
+            return False
+        existing = next((r for r in rows if (r["platform"], r["chat_id"], r["thread_id"] or "") == key[1:]), None)
+        meta = _decode_notify_delivery_metadata(existing["delivery_metadata"]) if existing is not None else {}
+        meta.pop(ROUTE_FAILURES_KEY, None)
+        meta.update({ROUTE_ROLE_KEY: ROLE_FALLBACK, ROUTE_ORIGIN_KEY: str(origin)[:200]})
+        metadata_json = _encode_notify_delivery_metadata(meta)
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO kanban_notify_subs
+                    (task_id, platform, chat_id, thread_id, user_id, chat_type, notifier_profile,
+                     delivery_mode, delivery_metadata, created_at, last_event_id, last_ping_event_id)
+                VALUES (?, ?, ?, ?, ?, 'dm', ?, 'notify', ?, ?, ?, ?)
+                """,
+                (*key, user_id, notifier_profile, metadata_json, int(time.time()), start, start),
+            )
+        else:
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_mode = 'notify', delivery_metadata = ?, "
+                "last_event_id = ? " + _SUB_KEY_WHERE,
+                (metadata_json, start, *key),
+            )
+    return True
+
+
+def record_fallback_sent(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Persist the one-shot fallback delivery marker independently of its subscription row."""
+    with _kb.write_txn(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, FALLBACK_SENT_EVENT),
+        ).fetchone()
+        if existing is not None:
+            return False
+        _kb._append_event(conn, task_id, FALLBACK_SENT_EVENT, {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id or "",
+        })
+    return True
+
+
+def ensure_topic_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    role: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    start_cursor: int,
+    origin: str,
+) -> bool:
+    """Create one durable notify-only Ops-topic route for ``task_id``/``role``.
+
+    The role is the dedup identity, while the subscription primary key remains
+    the physical Telegram destination. Existing rows are never repurposed: in
+    particular, a fallback already occupying Alerts remains the task's single
+    alert route. New rows begin immediately before the event that selected the
+    route, so activation cannot replay older card history.
+    """
+    if role not in (ROLE_ALERTS, ROLE_APPROVALS, ROLE_OPS):
+        raise ValueError(f"unsupported topic route role: {role}")
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    start = int(start_cursor)
+    with _kb.write_txn(conn):
+        rows = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,)).fetchall()
+        for row in rows:
+            meta = _decode_notify_delivery_metadata(row["delivery_metadata"])
+            if meta.get(ROUTE_ROLE_KEY) == role:
+                return False
+            if (row["platform"], row["chat_id"], row["thread_id"] or "") == key[1:]:
+                return False
+        metadata_json = _encode_notify_delivery_metadata({
+            ROUTE_ROLE_KEY: role,
+            ROUTE_ORIGIN_KEY: str(origin)[:200],
+        })
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, chat_type, notifier_profile,
+                 delivery_mode, delivery_metadata, created_at, last_event_id, last_ping_event_id)
+            VALUES (?, ?, ?, ?, 'group', ?, 'notify', ?, ?, ?, ?)
+            """,
+            (*key, notifier_profile, metadata_json, int(time.time()), start, start),
+        )
+    return True
+
+
+def unconsumed_events_for_platform(
+    conn: sqlite3.Connection, *, platform: str, kinds: Iterable[str], min_created_at: int, max_created_at: int,
+) -> list[tuple[dict, Event]]:
+    """``(sub, event)`` pairs whose event the ``platform`` subscription has not claimed yet,
+    restricted to a ``created_at`` window. Used to detect a Desktop (``tui``) origin that
+    left an actionable event unacknowledged past the staleness window."""
+    kind_list = list(kinds)
+    if not kind_list:
+        return []
+    rows = conn.execute(
+        "SELECT s.task_id AS s_task_id, s.platform AS s_platform, s.chat_id AS s_chat_id, "
+        "       s.thread_id AS s_thread_id, s.last_event_id AS s_cursor, s.delivery_metadata AS s_meta, "
+        "       s.notifier_profile AS s_profile, e.* "
+        "  FROM kanban_notify_subs s JOIN task_events e "
+        "    ON e.task_id = s.task_id AND e.id > s.last_event_id "
+        " WHERE LOWER(s.platform) = LOWER(?) AND e.created_at >= ? AND e.created_at <= ? "
+        "   AND e.kind IN (" + ",".join("?" * len(kind_list)) + ") "
+        " ORDER BY e.id ASC",
+        (platform, int(min_created_at), int(max_created_at), *kind_list),
+    ).fetchall()
+    out: list[tuple[dict, Event]] = []
+    for r in rows:
+        sub = {
+            "task_id": r["s_task_id"], "platform": r["s_platform"], "chat_id": r["s_chat_id"],
+            "thread_id": r["s_thread_id"] or "", "last_event_id": int(r["s_cursor"]),
+            "notifier_profile": r["s_profile"],
+            "delivery_metadata": _decode_notify_delivery_metadata(r["s_meta"]),
+        }
+        out.append((sub, _kb.Event.from_row(r)))
+    return out
+
+
+def claim_notify_cursor_range(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str, thread_id: Optional[str] = None,
+    old_cursor: int, new_cursor: int,
+) -> bool:
+    """CAS-advance a cursor over a caller-selected prefix of unseen events (False if another notifier won)."""
+    with _kb.write_txn(conn):
+        cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), new_cursor, old_cursor)
     return cur.rowcount > 0
 
 

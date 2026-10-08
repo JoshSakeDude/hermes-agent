@@ -76,6 +76,11 @@ class GatewayKanbanWatchersMixin:
         except Exception as exc:
             logger.warning("kanban notifier: cannot load config (%s); continuing enabled", exc)
             kanban_cfg = {}
+        from gateway import kanban_notify_routing as _routing
+        self._kanban_notify_routing = _routing.routing_mode({"kanban": kanban_cfg})
+        self._kanban_origin_stale_seconds = _routing.origin_stale_seconds({"kanban": kanban_cfg})
+        if not hasattr(self, "_kanban_notify_started_at"):
+            self._kanban_notify_started_at = int(time.time())
         if not kanban_cfg.get("notify_in_gateway", True):
             logger.info("kanban notifier: disabled via config kanban.notify_in_gateway=false")
             return
@@ -120,7 +125,7 @@ class GatewayKanbanWatchersMixin:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)
 
-    def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
+    def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> Any:
         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
@@ -132,7 +137,7 @@ class GatewayKanbanWatchersMixin:
         with _kb.pin_first_board_resolution():
             conn = _kbc.connect(board=board)
             try:
-                getattr(_kbn, op)(
+                return getattr(_kbn, op)(
                     conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
                     thread_id=sub.get("thread_id") or "", **extra,
                 )

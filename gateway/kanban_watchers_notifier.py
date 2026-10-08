@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
+import time
 from functools import partial
 from pathlib import Path
 import weakref
@@ -17,6 +19,7 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 
+from gateway import kanban_notify_routing as _routing
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
 from gateway.wake import session_owned_by_profile
 
@@ -220,6 +223,34 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     return primary if profile == primary_profile else None
 
 
+_TOPIC_MAP_WARNED: set[tuple[str, str]] = set()
+
+
+def _ops_topic_target(runner: Any, topic: str, notifier_profile: Optional[str]) -> Optional[dict]:
+    """Resolve one Gohan Ops forum topic without ever falling back to the home DM."""
+    from gateway.config import Platform
+    if Platform.TELEGRAM not in (getattr(runner, "adapters", None) or {}):
+        return None
+    from hermes_constants import get_default_hermes_root
+    path = get_default_hermes_root() / "telegram_topics.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        topics = data.get("topics") if isinstance(data, dict) else None
+        chat_id = data.get("chat_id") if isinstance(data, dict) else None
+        thread_id = topics.get(topic) if isinstance(topics, dict) else None
+        if not chat_id or not thread_id:
+            raise ValueError(f"missing chat_id or topics.{topic}")
+    except Exception as exc:
+        key = (str(path), topic)
+        if key not in _TOPIC_MAP_WARNED:
+            _TOPIC_MAP_WARNED.add(key)
+            logger.warning("kanban notifier: Telegram topic map unavailable for %s; no fallback created (%s)",
+                           topic, exc)
+        return None
+    return {"platform": "telegram", "chat_id": str(chat_id), "thread_id": str(thread_id),
+            "notifier_profile": notifier_profile}
+
+
 # --- Collection (runs in a worker thread) ---
 
 
@@ -248,6 +279,10 @@ class _Collector:
         # and again at delivery, rewinding if the route or adapter changed.
         self.active_platforms = _platform_names(runner.adapters).union(
             *(_platform_names(m) for m in self.profile_adapters.values()))
+        self.routing = getattr(runner, "_kanban_notify_routing", None) or _routing.LEGACY
+        self.stale_seconds = getattr(runner, "_kanban_origin_stale_seconds", None) or _routing.DEFAULT_ORIGIN_STALE_SECONDS
+        self.started_at = int(getattr(runner, "_kanban_notify_started_at", time.time()))
+        self._subs_by_task: dict[str, list[dict]] = {}
 
     def collect(self) -> list[dict]:
         if not self.active_platforms:
@@ -284,10 +319,10 @@ class _Collector:
             logger.debug("kanban notifier: read-only subscription probe failed "
                          "for board %s (%s); falling back to writable open", slug, exc)
             return True
-        if count == 0:
+        if count == 0 and self.routing != _routing.ORIGIN_FIRST:
             logger.debug("kanban notifier: board %s has no subscriptions owned by %s; skipping open",
                          slug, sorted(self.notifier_profiles))
-        return count != 0
+        return count != 0 or self.routing == _routing.ORIGIN_FIRST
 
     def _gc_stale_subs(self, conn: Any, slug: str) -> None:
         """Best-effort stale-sub sweep: a failed sweep never blocks delivery; the next hourly gate retries."""
@@ -311,16 +346,188 @@ class _Collector:
         if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
             _warn_anchorless_thread_sub_once(sub, platform)
             return None
+        role = None
+        if self.routing == _routing.ORIGIN_FIRST:
+            role = _routing.sub_role(sub, self._task_subs(conn, sub["task_id"]))
+            if role == _routing.ROLE_FALLBACK:
+                return self._claim_fallback(conn, slug, sub)
+            if role == _routing.ROLE_PASSIVE:
+                return None  # retired Fred-DM cron rows are silent and never consume pending work
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
         )
+        if role is not None:
+            # Origin-first: mirrors consume silently; everyone else only sees actionable events.
+            # The cursor has already advanced over the dropped events, so they never replay.
+            if role == _routing.ROLE_MIRROR:
+                events = []
+            else:
+                events = [ev for ev in events if _routing.is_actionable(ev)]
+                if role in (_routing.ROLE_ALERTS, _routing.ROLE_APPROVALS):
+                    events = [ev for ev in events if _routing.event_topic_role(ev) == role]
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task,
+                "board": slug, "role": role}
+
+    def _task_subs(self, conn: Any, task_id: str) -> list[dict]:
+        if task_id not in self._subs_by_task:
+            self._subs_by_task[task_id] = _kbn().list_notify_subs(conn, task_id)
+        return self._subs_by_task[task_id]
+
+    def _claim_fallback(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
+        """Claim the prefix of a fallback row's events that the origin demonstrably missed.
+
+        An event the live origin already consumed is skipped; an event still inside the
+        origin's staleness window stops the claim (re-examined next tick). A push origin is
+        retired on permanent failure, so with no origin row every actionable event is due.
+        """
+        kbn = _kbn()
+        key = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                   thread_id=sub.get("thread_id") or "")
+        old_cursor = int(sub.get("last_event_id") or 0)
+        _cursor, events = kbn.unseen_events_for_sub(conn, kinds=TERMINAL_KINDS, **key)
+        siblings = self._task_subs(conn, sub["task_id"])
+        origins = [s for s in siblings if _routing.sub_role(s, siblings) == _routing.ROLE_ORIGIN]
+        consumed = min((int(s.get("last_event_id") or 0) for s in origins), default=None)
+        cutoff = int(time.time()) - int(self.stale_seconds)
+        due, new_cursor = [], old_cursor
+        for ev in events:
+            if consumed is not None and ev.id > consumed and ev.created_at > cutoff:
+                break
+            new_cursor = ev.id
+            if (consumed is None or ev.id > consumed) and _routing.is_actionable(ev):
+                due.append(ev)
+        if new_cursor == old_cursor or not kbn.claim_notify_cursor_range(
+                conn, old_cursor=old_cursor, new_cursor=new_cursor, **key):
+            return None
+        if not due:
+            return None
+        task = self.kb.get_task(conn, sub["task_id"])
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": new_cursor, "events": due, "task": task,
+                "board": slug, "role": _routing.ROLE_FALLBACK}
+
+    def _ops_topic_target(self, topic: str) -> Optional[dict]:
+        if "telegram" not in self.active_platforms:
+            return None
+        return _ops_topic_target(self.runner, topic, self.notifier_profile)
+
+    def _ensure_ops_topic_routes(self, conn: Any) -> None:
+        """Materialize durable topic subscriptions before normal claiming.
+
+        Non-Telegram origins mirror failures to Alerts and decisions to
+        Approvals. Cards with no origin route every actionable event to Ops.
+        Telegram origins already are the notification destination and never get
+        a duplicate forum notice.
+        """
+        if not self.include_unowned:
+            return
+        kbn = _kbn()
+        by_task: dict[str, list[dict]] = {}
+        for sub in kbn.list_notify_subs(conn):
+            by_task.setdefault(sub["task_id"], []).append(sub)
+        for task_id, siblings in by_task.items():
+            task = self.kb.get_task(conn, task_id)
+            if task is None or task.status == "archived":
+                continue
+            classified = [(sub, _routing.sub_role(sub, siblings)) for sub in siblings]
+            origins = [sub for sub, role in classified if role == _routing.ROLE_ORIGIN]
+            if any((sub.get("platform") or "").lower() == "telegram" for sub in origins):
+                continue
+            sources = [
+                sub for sub, role in classified
+                if role in (_routing.ROLE_ORIGIN, _routing.ROLE_MIRROR, _routing.ROLE_PASSIVE)
+            ]
+            if not sources:
+                continue
+            unseen: dict[int, Any] = {}
+            for source in sources:
+                _cursor, events = kbn.unseen_events_for_sub(
+                    conn, task_id=task_id, platform=source["platform"], chat_id=source["chat_id"],
+                    thread_id=source.get("thread_id") or "", kinds=TERMINAL_KINDS,
+                )
+                unseen.update((ev.id, ev) for ev in events)
+            origin = (", ".join(_routing.describe_origin(sub) for sub in origins)
+                      if origins else "automation (script/cron/CLI)")
+            role_events: dict[str, list[Any]] = {}
+            for ev in sorted(unseen.values(), key=lambda item: item.id):
+                # Subscription cursors can remain untouched for months (notably
+                # pull-based Desktop origins). Match the headless-card guard below:
+                # activation may route only events created during this notifier run.
+                if ev.created_at < self.started_at:
+                    continue
+                if not _routing.is_actionable(ev):
+                    continue
+                role = _routing.event_topic_role(ev) if origins else _routing.ROLE_OPS
+                if role:
+                    role_events.setdefault(role, []).append(ev)
+            for role, events in role_events.items():
+                target = self._ops_topic_target(role)
+                if target is None:
+                    continue
+                if kbn.ensure_topic_notify_sub(
+                    conn, task_id=task_id, role=role, start_cursor=events[0].id - 1,
+                    origin=origin, **target,
+                ):
+                    self._subs_by_task.clear()
+        # Truly headless cards have no subscription row to anchor a cursor.
+        # Only consider events created since this notifier process started, so
+        # enabling origin-first cannot replay the board's historical backlog.
+        rows = conn.execute(
+            "SELECT e.* FROM task_events e JOIN tasks t ON t.id = e.task_id "
+            "WHERE t.status != 'archived' AND e.created_at >= ? "
+            "AND e.kind IN (" + ",".join("?" * len(TERMINAL_KINDS)) + ") "
+            "AND NOT EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = e.task_id) "
+            "ORDER BY e.id ASC",
+            (self.started_at, *TERMINAL_KINDS),
+        ).fetchall()
+        headless: dict[str, list[Any]] = {}
+        for row in rows:
+            ev = self.kb.Event.from_row(row)
+            if _routing.is_actionable(ev):
+                headless.setdefault(ev.task_id, []).append(ev)
+        target = self._ops_topic_target(_routing.ROLE_OPS) if headless else None
+        if target is not None:
+            for task_id, events in headless.items():
+                if kbn.ensure_topic_notify_sub(
+                    conn, task_id=task_id, role=_routing.ROLE_OPS, start_cursor=events[0].id - 1,
+                    origin="automation (script/cron/CLI)", **target,
+                ):
+                    self._subs_by_task.clear()
+
+    def _fallback_stale_desktop_origins(self, conn: Any, slug: str) -> None:
+        """Desktop (``tui``) origins are pull-based: an actionable event left unclaimed past the
+        staleness window means nobody saw it, so the task gets its single fallback row."""
+        if not self.include_unowned:
+            return  # one gateway (the dispatcher owner) makes this board-wide decision
+        target = self._ops_topic_target(_routing.ROLE_ALERTS)
+        if target is None:
+            return
+        lo, hi = _routing.stale_window({"kanban": {"origin_stale_seconds": self.stale_seconds}})
+        kbn = _kbn()
+        seen: set[str] = set()
+        for desk, ev in kbn.unconsumed_events_for_platform(
+                conn, platform="tui", kinds=_routing.ACTIONABLE_KINDS, min_created_at=lo, max_created_at=hi):
+            tid = desk["task_id"]
+            if tid in seen or not _routing.is_actionable(ev):
+                continue
+            task = self.kb.get_task(conn, tid)
+            if task is None or task.status == "archived":
+                continue
+            if _routing.event_topic_role(ev):
+                continue  # already handled by the dedicated Alerts/Approvals route
+            if _routing.sub_role(desk, self._task_subs(conn, tid)) != _routing.ROLE_ORIGIN:
+                continue
+            seen.add(tid)
+            if kbn.ensure_fallback_notify_sub(conn, task_id=tid, start_cursor=ev.id - 1,
+                                               origin=_routing.describe_origin(desk), **target):
+                logger.warning("kanban notifier: desktop origin %s left %s %s unacknowledged; created "
+                               "telegram fallback", _routing.describe_origin(desk), tid, ev.kind)
+                self._subs_by_task.clear()
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -333,8 +540,15 @@ class _Collector:
             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
             return
         try:
+            self._subs_by_task.clear()
             if self.gc_due:
                 self._gc_stale_subs(conn, slug)
+            if self.routing == _routing.ORIGIN_FIRST:
+                try:
+                    self._ensure_ops_topic_routes(conn)
+                    self._fallback_stale_desktop_origins(conn, slug)
+                except Exception as exc:
+                    logger.warning("kanban notifier: desktop-origin fallback scan failed on board %s: %s", slug, exc)
             # No explicit init_db(): connect() already runs the migration once per
             # process, and init_db() would re-run it on a second connection racing
             # the first.
@@ -515,9 +729,14 @@ class _KanbanNotification:
         self.head = t("gateway.kanban.ping.head", board_tag=self.board_tag, assignee_tag=tag, task_id=self.task_id)
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
-        mode = sub.get("delivery_mode") or "notify"
+        self.mode = mode = sub.get("delivery_mode") or "notify"
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
+        # Origin-first role (None under legacy routing). A fallback or passive row is never
+        # anyone's conversation: it delivers a notify-only ping and never wakes an agent.
+        self.role = d.get("role")
+        if self.role in (_routing.ROLE_FALLBACK, _routing.ROLE_PASSIVE):
+            self.wake_agent, self.send_passive = False, True
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
@@ -544,6 +763,9 @@ class _KanbanNotification:
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
         """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
+        if self.role == _routing.ROLE_ORIGIN:
+            await self._origin_failed(fmt, prefix, exc, exc_info)
+            return
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
@@ -553,6 +775,48 @@ class _KanbanNotification:
             self.clear_failures()
         else:
             await self.rewind()
+
+    async def _origin_failed(self, fmt: str, prefix: tuple, exc: Exception, exc_info: bool) -> None:
+        """Origin-first: durable bounded retry, then exactly one notify-only home fallback.
+
+        The count lives in the row so a gateway restart cannot reset the budget. Past the limit
+        the fallback is created FROM the failed claim's start cursor (nothing is lost), then the
+        dead origin row is retired so it stops spinning. An Alerts topic that IS the dead origin
+        gets no fallback (that would re-target the same dead chat).
+        """
+        fails = int(await _to_thread_process_service(partial(
+            self.runner._kanban_sub_op, self.board_slug, "bump_route_failures", self.sub)) or 0)
+        logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
+        if fails < MAX_SEND_FAILURES:
+            await self.rewind()
+            return
+        target = _ops_topic_target(
+            self.runner, _routing.ROLE_ALERTS,
+            self.sub_profile or getattr(self.runner, "_kanban_notifier_profile", None),
+        )
+        if target and (target["platform"], target["chat_id"], target["thread_id"] or "") != tuple(self.sub_key[1:]):
+            created = await _to_thread_process_service(partial(self._create_fallback, target))
+            logger.warning("kanban notifier: origin %s for %s failed %d times; %s telegram fallback",
+                           _routing.describe_origin(self.sub), self.task_id, fails,
+                           "created" if created else "reusing existing")
+        else:
+            logger.warning("kanban notifier: origin %s for %s failed %d times and no distinct Alerts topic "
+                           "exists; dropping subscription", _routing.describe_origin(self.sub), self.task_id, fails)
+        await self.unsub()
+        self.clear_failures()
+
+    def _create_fallback(self, target: dict) -> bool:
+        # Delivery runs after the collector's pin-first context has exited. Keep
+        # this machine-flow write pinned so a board slug cannot redirect the
+        # fallback into an unrelated per-slug database.
+        with _pin_first():
+            conn = _kbc().connect(board=self.board_slug)
+            try:
+                return _kbn().ensure_fallback_notify_sub(
+                    conn, task_id=self.task_id, start_cursor=int(self.d.get("old_cursor") or 0),
+                    origin=_routing.describe_origin(self.sub), **target)
+            finally:
+                conn.close()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
         drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
@@ -678,7 +942,12 @@ class _KanbanNotification:
         from gateway.warning_notifications import present_notification
         sub, adapter = self.sub, self.adapter
         delivery_metadata = sub.get("delivery_metadata")
-        metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
+        metadata: dict[str, Any] = _routing.strip_route_metadata(
+            dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {})
+        if self.role == _routing.ROLE_FALLBACK:
+            msg = _routing.fallback_prefix(sub) + msg
+        elif self.role in (_routing.ROLE_ALERTS, _routing.ROLE_APPROVALS, _routing.ROLE_OPS):
+            msg = _routing.topic_prefix(sub) + msg
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
         _send_res = None
@@ -765,6 +1034,9 @@ class _KanbanNotification:
         self.adapter = adapter
         from gateway.wake import adapter_supports_push
         self.is_push_adapter = adapter_supports_push(adapter)
+        if self.role == _routing.ROLE_PASSIVE and not self.is_push_adapter:
+            # A stateless (api_server) row has no push channel: its wake IS the delivery.
+            self.wake_agent, self.send_passive = self.mode in ("notify+wake", "wake"), self.mode != "wake"
 
         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
@@ -813,8 +1085,16 @@ class _KanbanNotification:
                 )
                 return
 
-        # Delivery complete: advance the cursor (the dedup mechanism).
+        # Delivery complete: persist fallback dedup before the subscription can
+        # be removed, then advance the cursor.
+        if self.role == _routing.ROLE_FALLBACK:
+            await _to_thread_process_service(partial(
+                self.runner._kanban_sub_op, self.board_slug, "record_fallback_sent", self.sub))
         await self.advance()
+        if self.role == _routing.ROLE_ORIGIN and (self.sub.get("delivery_metadata") or {}).get(
+                _kbn().ROUTE_FAILURES_KEY):
+            await _to_thread_process_service(partial(
+                self.runner._kanban_sub_op, self.board_slug, "clear_route_failures", self.sub))
         if not is_push:
             self.clear_failures()
         # Unsubscribe only on archive; ``done`` is reversible.

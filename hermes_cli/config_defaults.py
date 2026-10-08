@@ -1891,6 +1891,12 @@ DEFAULT_CONFIG = {
         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
         # not own notification subscriptions to avoid an idle five-second board probe.
         "notify_in_gateway": True,
+        # "legacy" (default): every subscription row delivers its own events. "origin_first": only
+        # the card's originating conversation hears actionable events; other rows are silent
+        # mirrors; one notify-only Gohan Ops Alerts fallback is created after permanent origin
+        # failure (or a Desktop origin leaving an event unacknowledged for origin_stale_seconds).
+        "notification_routing": "legacy",
+        "origin_stale_seconds": 600,
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
