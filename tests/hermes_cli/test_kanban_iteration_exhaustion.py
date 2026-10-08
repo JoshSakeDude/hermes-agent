@@ -157,30 +157,44 @@ def test_stale_run_exhaustion_is_ignored(kanban_home, monkeypatch):
         ).fetchone()["ended_at"] is None
 
 
-def test_duplicate_exhaustion_is_ignored_and_creates_one_split_followup(
-    kanban_home, monkeypatch
-):
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config_readonly",
-        lambda: {"kanban": {"orchestrator_profile": "planner"}},
-    )
-    task_id, run_id = _claim(
-        title="large card",
-        body="finish remaining work",
-        tenant="tenant-a",
-        session_id="session-a",
-    )
+def test_duplicate_exhaustion_is_ignored(kanban_home, monkeypatch):
+    task_id, run_id = _claim()
     _exhaust(monkeypatch, task_id, run_id)
     _exhaust(monkeypatch, task_id, run_id)
 
     with kbc.connect_closing() as conn:
         assert len(_events(conn, task_id, "gave_up")) == 1
         assert kb.get_task(conn, task_id).consecutive_failures == 1
-        followups = conn.execute(
-            "SELECT * FROM tasks WHERE idempotency_key = ?", (f"split:{task_id}",)
-        ).fetchall()
-        assert len(followups) == 1
-        followup = followups[0]
+
+
+def test_create_split_followup_creates_one_linked_card_with_wake_text(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"orchestrator_profile": "planner"}},
+    )
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="large card",
+            body="finish remaining work",
+            assignee="gohanlite",
+            tenant="tenant-a",
+            session_id="session-a",
+        )
+        followup_id = kb.create_split_followup(
+            conn,
+            task_id,
+            budget_used=45,
+            budget_max=45,
+            handoff_summary="completed the parser; API remains",
+        )
+        followup = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (followup_id,)
+        ).fetchone()
+        assert followup is not None
+        assert followup["idempotency_key"] == f"split:{task_id}"
         assert followup["assignee"] == "planner"
         assert followup["tenant"] == "tenant-a"
         assert followup["session_id"] == "session-a"
@@ -188,9 +202,61 @@ def test_duplicate_exhaustion_is_ignored_and_creates_one_split_followup(
         assert followup["goal_mode"] == 0
         assert followup["workspace_kind"] == "scratch"
         assert followup["status"] == "ready"
+        assert "Iteration budget: 45/45" in followup["body"]
+        assert "completed the parser; API remains" in followup["body"]
+        assert f"hermes kanban archive {task_id}" in followup["body"]
+        created_payload = _events(conn, followup_id, "created")[0]
+        assert created_payload["creator_task_id"] == task_id
         assert _events(conn, task_id, "split_followup_created") == [
             {"followup_task_id": followup["id"]}
         ]
+
+
+def test_create_split_followup_is_idempotent(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="large card", assignee="gohanlite")
+        first = kb.create_split_followup(conn, task_id, budget_used=45, budget_max=45)
+        second = kb.create_split_followup(conn, task_id, budget_used=45, budget_max=45)
+        assert second == first
+        assert conn.execute(
+            "SELECT count(*) FROM tasks WHERE idempotency_key = ?", (f"split:{task_id}",)
+        ).fetchone()[0] == 1
+        assert _events(conn, task_id, "split_followup_created") == [
+            {"followup_task_id": first}
+        ]
+
+
+def test_create_split_followup_never_splits_split_depth(kanban_home):
+    with kbc.connect_closing() as conn:
+        split = kb.create_task(
+            conn,
+            title="split",
+            assignee="planner",
+            idempotency_key="split:t_original",
+        )
+        child = kb.create_task(
+            conn,
+            title="replacement",
+            assignee="worker",
+            creator_task_id=split,
+        )
+
+        assert kb.create_split_followup(
+            conn, split, budget_used=25, budget_max=25
+        ) is None
+        assert kb.create_split_followup(
+            conn, child, budget_used=45, budget_max=45
+        ) is None
+        assert _events(conn, split, "split_followup_skipped") == [
+            {"reason": "split_card"}
+        ]
+        assert _events(conn, child, "split_followup_skipped") == [
+            {"reason": "split_child"}
+        ]
+        assert conn.execute(
+            "SELECT count(*) FROM tasks WHERE idempotency_key IN (?, ?)",
+            (f"split:{split}", f"split:{child}"),
+        ).fetchone()[0] == 0
 
 
 def test_create_task_persists_per_card_max_iterations(kanban_home):

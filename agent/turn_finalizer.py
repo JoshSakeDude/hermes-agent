@@ -74,26 +74,10 @@ def _record_kanban_budget_exhausted(
             )
             return
     try:
-        from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_dispatch as _kbd
         _conn = _kbc.connect()
         try:
-            def _queue_split_followup() -> None:
-                try:
-                    _kb.create_split_followup(
-                        _conn, kanban_task, budget_used=api_call_count,
-                        budget_max=max_iterations, handoff_summary=handoff_summary,
-                    )
-                except Exception:
-                    _kb._append_event(
-                        _conn, kanban_task, "split_followup_skipped", {"reason": "creation_failed"},
-                    )
-                    logger.warning(
-                        "Budget exhaustion blocked task %s but its split follow-up could not be queued",
-                        kanban_task, exc_info=True,
-                    )
-
             _kbd._record_task_failure(
                 _conn,
                 kanban_task,
@@ -113,9 +97,11 @@ def _record_kanban_budget_exhausted(
                     "block_cause": "iteration_budget_exhausted",
                     "reason_code": "iteration_budget_exhausted",
                     "retryable": False,
-                    "operator_hint": "A split follow-up will be queued; do not retry or raise the limit.",
+                    "operator_hint": (
+                        "Split the card into smaller cards (one deliverable, one stage), "
+                        "then unblock or archive it. Do not raise its limit."
+                    ),
                 },
-                on_trip=_queue_split_followup,
             )
         finally:
             with suppress(Exception):
