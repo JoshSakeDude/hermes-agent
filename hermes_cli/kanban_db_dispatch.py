@@ -2803,6 +2803,9 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.append("chat")
+    # This is a chat-subcommand flag, not a global flag. Placing it before
+    # ``chat`` makes argparse exit 2. Leave it absent when the card has no
+    # override so the worker profile's configured default remains authoritative.
     if task.max_iterations is not None:
         cmd.extend(["--max-turns", str(task.max_iterations)])
     cmd.extend(["-q", f"work kanban task {task.id}"])

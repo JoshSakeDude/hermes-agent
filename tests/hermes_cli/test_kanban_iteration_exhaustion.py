@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -241,3 +242,39 @@ def test_worker_argv_passes_per_card_budget_after_chat(monkeypatch):
     parsed = parser.parse_args(argv[chat:])
     assert parsed.max_turns == 20
     assert parsed.query == "work kanban task t_budget"
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [(20, ["--max-turns", "20"]), (None, [])],
+)
+def test_spawned_worker_argv_uses_only_explicit_card_budget(
+    kanban_home, monkeypatch, tmp_path, budget, expected
+):
+    """Assert the command at the Popen boundary, not only the argv helper."""
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda home: None)
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, command: command)
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(command, *args, **kwargs):
+        captured["command"] = list(command)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "worker"
+    workspace.mkdir()
+    task = _argv_task(max_iterations=budget)
+
+    assert kbd._default_spawn(task, str(workspace)) == FakeProc.pid
+    command = captured["command"]
+    chat = command.index("chat")
+    assert "--max-turns" not in command[:chat]
+    if budget is None:
+        assert expected == []
+        assert "--max-turns" not in command
+    else:
+        assert command[chat + 1 : chat + 3] == expected

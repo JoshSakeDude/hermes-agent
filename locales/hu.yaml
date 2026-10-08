@@ -233,6 +233,10 @@ gateway:
       review_detail: "Átnézési visszajelzés: {reason}\nNézd meg a meglévő kártyát és az aktuális átnézési futást; a munkát ugyanahhoz a megvalósítási feladathoz add vissza. Ezt a BLOCK-ot ne tekintsd jóváhagyásnak, és ne hozz létre duplikált feladatot."
       guidance: "Ez egy automatikus feladatállapot-értesítés, nem kérés a feladat újbóli felbontására. Nézd meg az aktuális táblát, mielőtt követő feladatokat hoznál létre; ne hozz létre újra már létező feladatokat vagy gráfokat."
     ping:
+      budget_exhausted: "⛔ {head} blocked: iteration budget exhausted ({used}/{max}) — split the card; no automatic retry"
+      gave_up_failures: "⛔ {head} blocked after {failures} failures; no automatic retry{error}"
+      gave_up_repeated: "⛔ {head} blocked after repeated failures; no automatic retry{error}"
+      error_line: "\n{value}"
       completed: "✔ {head} kész — {title}{handoff}"
       review_requested: "👀 {head} átnézésre kész — {title}{handoff}"
       changes_default_reason: "az átnéző visszajelzése módosítást kér"

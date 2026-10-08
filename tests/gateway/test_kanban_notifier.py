@@ -648,6 +648,42 @@ def _fmt_block_loop(payload):
     return msg
 
 
+def _fmt_terminal(kind, payload):
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    notif = type("Notif", (), {
+        "head": "Kanban t_abc123",
+        "task_id": "t_abc123",
+    })()
+    msg, _, _ = _EVENT_FORMATTERS[kind](_StubEvent(payload), notif)
+    return msg
+
+
+def test_gateway_formats_iteration_budget_exhaustion_as_non_retryable():
+    payload = {
+        "reason_code": "iteration_budget_exhausted",
+        "budget_used": 45,
+        "budget_max": 45,
+    }
+    text = _fmt_terminal("gave_up", payload)
+    assert "iteration budget exhausted (45/45)" in text
+    assert "split the card" in text
+    assert "no automatic retry" in text
+    assert "spawn failures" not in text
+
+
+def test_gateway_generic_gave_up_and_unknown_timeout_are_truthful():
+    gave_up = _fmt_terminal("gave_up", {"failures": 2, "error": "worker crashed"})
+    assert "blocked after 2 failures" in gave_up
+    assert "no automatic retry" in gave_up
+    assert "worker crashed" in gave_up
+    assert "spawn failures" not in gave_up
+
+    timed_out = _fmt_terminal("timed_out", {})
+    assert "timed out" in timed_out or "ran past" in timed_out
+    assert "0" not in timed_out
+
+
 def test_block_loop_technical_kind_uses_neutral_orchestration_wording():
     """A repeated technical block (transient/capability/untyped) routed to
     triage is an orchestration handoff with no question for the owner, so the
