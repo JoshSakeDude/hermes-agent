@@ -2,7 +2,16 @@
 
 import json
 
-from tools.todo_tool import TodoStore, todo_tool
+from tools.todo_tool import TODO_SCHEMA, TodoStore, todo_tool
+
+
+def test_schema_routes_durable_work_to_kanban():
+    description = TODO_SCHEMA["description"]
+    assert "Kanban intake policy" in description
+    assert "multi-system coordination" in description
+    assert "separate approval/review/monitoring phase" in description
+    assert "Never substitute this checklist" in description
+
 
 class TestWriteAndRead:
     def test_write_replaces_list(self):
