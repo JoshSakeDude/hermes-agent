@@ -4655,22 +4655,12 @@ class TestRunConversation:
 
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
-        """Regression: kanban worker must signal the dispatcher when its
-        iteration budget is exhausted, otherwise the task silently re-runs
-        forever without ever tripping the failure_limit circuit breaker
-        (issue #23216 / #29747 gap 2).
-
-        As of #29747, the exhaustion path routes through
-        ``kanban_db._record_task_failure(outcome="timed_out")`` so the
-        ``consecutive_failures`` counter increments and the dispatcher's
-        ``failure_limit`` breaker eventually trips. The legacy
-        ``kanban_block`` call was replaced because blocked-outcome runs
-        bypass the failure counter.
-        """
+        """Iteration exhaustion must sticky-block on the first report."""
         self._setup_agent(agent)
         agent.max_iterations = 2
 
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
 
         # Return a tool call for every iteration to exhaust the budget.
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -4702,8 +4692,7 @@ class TestRunConversation:
         # The agent should have reported the task as not completed.
         assert result["completed"] is False
 
-        # _record_task_failure should have been called exactly once for
-        # the exhaustion event, with outcome="timed_out".
+        # The exhaustion event is a non-retryable sizing failure, not a timeout.
         assert mock_record_failure.call_count == 1, (
             f"Expected exactly 1 _record_task_failure call, "
             f"got {mock_record_failure.call_count}. "
@@ -4712,9 +4701,14 @@ class TestRunConversation:
         call = mock_record_failure.call_args_list[0]
         # Positional: (conn, task_id, ...)
         assert call.args[1] == "t_test_task_123"
-        assert call.kwargs.get("outcome") == "timed_out"
+        assert call.kwargs.get("outcome") == "iteration_budget_exhausted"
+        assert call.kwargs.get("force_trip") is True
+        assert call.kwargs.get("expected_run_id") == 123
+        assert call.kwargs.get("run_summary") == "Could not finish — budget exhausted."
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
+        assert call.kwargs["event_payload_extra"]["retryable"] is False
+        assert call.kwargs["event_payload_extra"]["reason_code"] == "iteration_budget_exhausted"
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK

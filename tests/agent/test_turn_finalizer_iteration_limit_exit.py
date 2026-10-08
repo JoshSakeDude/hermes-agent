@@ -165,9 +165,10 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_records_kanban_timeout(monkeypatch):
+def test_pending_response_records_nonretryable_iteration_exhaustion(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
@@ -186,10 +187,21 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         conn,
         "task-123",
         error=ANY,
-        outcome="timed_out",
+        outcome="iteration_budget_exhausted",
+        force_trip=True,
         release_claim=True,
         end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        run_summary="composed report",
+        expected_run_id=123,
+        event_payload_extra={
+            "budget_used": 60,
+            "budget_max": 60,
+            "block_cause": "iteration_budget_exhausted",
+            "reason_code": "iteration_budget_exhausted",
+            "retryable": False,
+            "operator_hint": "A split follow-up will be queued; do not retry or raise the limit.",
+        },
+        on_trip=ANY,
     )
 
 
@@ -267,11 +279,16 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-456"
-    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["outcome"] == "iteration_budget_exhausted"
+    assert kwargs["force_trip"] is True
+    assert kwargs["expected_run_id"] is None
+    assert kwargs["run_summary"] is None
     assert kwargs["release_claim"] is True
     assert kwargs["end_run"] is True
     assert kwargs["event_payload_extra"]["budget_used"] == 60
     assert kwargs["event_payload_extra"]["budget_max"] == 60
+    assert kwargs["event_payload_extra"]["reason_code"] == "iteration_budget_exhausted"
+    assert kwargs["event_payload_extra"]["retryable"] is False
 
 
 def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
@@ -305,7 +322,7 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-789"
-    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["outcome"] == "iteration_budget_exhausted"
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
