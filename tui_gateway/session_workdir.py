@@ -233,6 +233,7 @@ def _resolve_create_cwd(params: dict, source: str, profile_home) -> tuple[bool, 
     them.
     """
     raw_cwd = str(params.get("cwd") or "").strip()
+    cwd_explicit = bool(params.get("cwd_explicit"))
     backend = _bound_terminal_backend(profile_home)
     backend_cwd = bool(raw_cwd) and (
         (backend == "ssh" and _is_remote_cwd_shape(raw_cwd))
@@ -245,7 +246,12 @@ def _resolve_create_cwd(params: dict, source: str, profile_home) -> tuple[bool, 
                 os.path.abspath(os.path.expanduser(raw_cwd)))
         except Exception:
             explicit_cwd = backend_cwd
-        if not explicit_cwd:
+        # Desktop sends its inherited launch/project hint in ``cwd`` even when the
+        # user did not pick a workspace.  A stale or client-only inherited hint
+        # must retain the launch-directory fallback; only a deliberate local pick
+        # is rejected when the gateway cannot stat it.  Backend-owned paths are
+        # accepted by shape because the gateway host cannot stat them.
+        if not explicit_cwd and cwd_explicit:
             raise ValueError(f"working directory does not exist: {raw_cwd}")
     session_cwd = _completion_cwd(params)
     if backend_cwd:

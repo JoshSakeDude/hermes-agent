@@ -31,10 +31,13 @@ def _create_desktop_session(params):
     return response["result"]
 
 
-def test_desktop_explicit_cwd_persists_when_local_probe_cannot_see_it(monkeypatch, tmp_path):
+def test_desktop_explicit_backend_cwd_persists_when_local_probe_cannot_see_it(
+    monkeypatch, tmp_path
+):
     db = _gateway_with_db(monkeypatch, tmp_path)
     workspace = tmp_path / "desktop-only-workspace"
     assert not workspace.exists()
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
 
     sid = None
     try:
