@@ -20,6 +20,21 @@ def config_check_diagnostics(config: dict[str, Any], get_env_value: Callable[[st
 
     diagnostics = validate_platform_toolsets(config.get("platform_toolsets"), saved_toolset_resolver(config))
 
+    legacy_toolsets = config.get("toolsets")
+    platform_toolsets = config.get("platform_toolsets")
+    if isinstance(legacy_toolsets, list) and "kanban" in legacy_toolsets and isinstance(platform_toolsets, dict):
+        shadowed = sorted(
+            str(platform)
+            for platform, selected_toolsets in platform_toolsets.items()
+            if isinstance(selected_toolsets, list) and "kanban" not in selected_toolsets
+        )
+        if shadowed:
+            diagnostics.append(
+                "legacy top-level toolsets enables 'kanban', but explicit platform_toolsets "
+                f"selection(s) omit it for: {', '.join(shadowed)}. Those platform selections "
+                "take precedence; add 'kanban' to them or remove the stale legacy opt-in."
+            )
+
     disabled = _get_disabled_plugins()
     for name, manifest in _platform_plugin_manifests(source="bundled"):
         key = f"platforms/{name}"
