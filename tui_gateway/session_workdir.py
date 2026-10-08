@@ -227,30 +227,30 @@ def _context_cwd_is_launch_artifact(session: dict | None) -> bool:
 def _resolve_create_cwd(params: dict, source: str, profile_home) -> tuple[bool, str, bool]:
     """``(explicit_cwd, session_cwd, remote_cwd)`` for a freshly created session.
 
-    Only a chosen workspace persists as cwd; the launch-dir fallback is "No workspace". A
-    chosen workspace is one the gateway host can ``isdir``-probe, an ssh-shaped cwd on a remote
-    profile, or — the #108205 desktop arm — a nonblank desktop-sourced cwd the host probe could
-    not vouch for: the client names a workspace its gateway host cannot see (Docker/remote
-    backend topology), and a failed host-side isdir is a topology artifact, not a verdict on
-    the client's path. The CLIENT vouches instead, with #52589 provenance: a deliberate pick
-    (``cwd_explicit``) adopts the raw path outright; an inherited app-global workspace only
-    counts once the completion resolution actually adopted it, so a launch-dir fallback still
-    persists nothing and a named profile's configured ``terminal.cwd`` keeps winning.
+    Only a chosen workspace persists as cwd; the launch-dir fallback is "No workspace". Local
+    paths must exist before session state is minted. SSH and container paths belong to their
+    execution backend, so the gateway validates only their path shape rather than host-statting
+    them.
     """
     raw_cwd = str(params.get("cwd") or "").strip()
-    remote_cwd = bool(raw_cwd) and _is_remote_cwd_shape(raw_cwd) and _cwd_is_remote(profile_home)
+    backend = _bound_terminal_backend(profile_home)
+    backend_cwd = bool(raw_cwd) and (
+        (backend == "ssh" and _is_remote_cwd_shape(raw_cwd))
+        or (backend not in {"local", "ssh"} and _is_container_path(raw_cwd))
+    )
     explicit_cwd = False
-    with contextlib.suppress(Exception):
-        explicit_cwd = bool(raw_cwd) and (
-            remote_cwd or os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd))))
+    if raw_cwd:
+        try:
+            explicit_cwd = backend_cwd or os.path.isdir(
+                os.path.abspath(os.path.expanduser(raw_cwd)))
+        except Exception:
+            explicit_cwd = backend_cwd
+        if not explicit_cwd:
+            raise ValueError(f"working directory does not exist: {raw_cwd}")
     session_cwd = _completion_cwd(params)
-    if raw_cwd and not explicit_cwd and source == "desktop":
-        if params.get("cwd_explicit"):
-            explicit_cwd = True
-            session_cwd = raw_cwd
-        elif session_cwd and session_cwd == os.path.abspath(os.path.expanduser(raw_cwd)):
-            explicit_cwd = True
-    return explicit_cwd, session_cwd, remote_cwd
+    if backend_cwd:
+        session_cwd = raw_cwd
+    return explicit_cwd, session_cwd, backend_cwd
 
 
 def _persisted_session_cwd(session: dict) -> str | None:

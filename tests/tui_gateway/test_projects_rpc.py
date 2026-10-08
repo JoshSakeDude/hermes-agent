@@ -339,6 +339,128 @@ def test_remote_scan_full_authoritative_replaces_cache(tmp_path):
     assert stale not in joined
 
 
+def test_remote_scan_empty_roots_defaults_to_backend_home(tmp_path, monkeypatch):
+    """An empty roots policy scans the backend user's home."""
+    from hermes_cli import projects_db as pdb
+
+    backend_home = tmp_path / "backend-home"
+    repo = backend_home / "projects" / "backend-repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    real_expanduser = os.path.expanduser
+    monkeypatch.setattr(
+        server.os.path,
+        "expanduser",
+        lambda value: str(backend_home) if value == "~" else real_expanduser(value),
+    )
+
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(
+            conn, {"enabled": True, "roots": [], "exclude_paths": []})
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert str(repo) in roots
+
+
+def test_remote_scan_matches_depth_junk_and_git_head_contract(tmp_path):
+    from hermes_cli import projects_db as pdb
+
+    root = tmp_path / "root"
+    valid = root / "one" / "two" / "valid"
+    too_deep = root / "one" / "two" / "three" / "too-deep"
+    junk = root / "node_modules" / "junk-repo"
+    invalid = root / "invalid"
+    for repo in (valid, too_deep, junk):
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (invalid / ".git").mkdir(parents=True)
+
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(
+            conn, {"enabled": True, "roots": [str(root)], "exclude_paths": []})
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert roots == [str(valid)]
+
+
+def test_remote_scan_normalizes_relative_roots_and_home_exclusions(tmp_path, monkeypatch):
+    from hermes_cli import projects_db as pdb
+
+    backend_home = tmp_path / "backend-home"
+    keep = backend_home / "work" / "keep"
+    excluded = backend_home / "work" / "skip" / "excluded"
+    for repo in (keep, excluded):
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    real_expanduser = os.path.expanduser
+
+    def _expand_backend_home(value):
+        if value == "~":
+            return str(backend_home)
+        if str(value).startswith("~/"):
+            return str(backend_home) + str(value)[1:]
+        return real_expanduser(value)
+
+    monkeypatch.setattr(server.os.path, "expanduser", _expand_backend_home)
+    policy = {"enabled": True, "roots": ["work"], "exclude_paths": ["~/work/skip"]}
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert roots == [str(keep)]
+
+
+def test_remote_scan_authoritative_empty_result_clears_cache(tmp_path):
+    from hermes_cli import projects_db as pdb
+
+    empty_root = tmp_path / "empty-root"
+    empty_root.mkdir()
+    stale = tmp_path / "stale-repo"
+    (stale / ".git").mkdir(parents=True)
+    (stale / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    with pdb.connect_closing() as conn:
+        pdb.record_discovered_repos(conn, [(str(stale), "stale-repo")])
+        authoritative = server._scan_discovered_repos_remote(
+            conn, {"enabled": True, "roots": [str(empty_root)], "exclude_paths": []})
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert roots == []
+
+
+def test_remote_scan_walk_onerror_preserves_cache(tmp_path, monkeypatch):
+    from hermes_cli import projects_db as pdb
+
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    stale = tmp_path / "stale-repo"
+    (stale / ".git").mkdir(parents=True)
+    (stale / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    walk_errors = []
+
+    def _walk_with_error(top, *args, **kwargs):
+        assert top == str(scan_root)
+        onerror = kwargs.get("onerror")
+        walk_errors.append("reported")
+        onerror(OSError("permission denied"))
+        return iter(())
+
+    monkeypatch.setattr(server.os, "walk", _walk_with_error)
+    with pdb.connect_closing() as conn:
+        pdb.record_discovered_repos(conn, [(str(stale), "stale-repo")])
+        authoritative = server._scan_discovered_repos_remote(
+            conn, {"enabled": True, "roots": [str(scan_root)], "exclude_paths": []})
+        roots = [row["root"] for row in pdb.list_discovered_repos(conn)]
+
+    assert walk_errors == ["reported"]
+    assert not authoritative
+    assert str(stale) in roots
+
+
 def test_terminal_session_persists_its_launch_cwd():
     """A terminal session's cwd IS its workspace, so the row must record it.
 
