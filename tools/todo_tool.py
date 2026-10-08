@@ -217,8 +217,12 @@ TODO_SCHEMA = {
     "name": "todo_list",
     "description": (
         # See #95681.
-        "Track a task list for multi-step work (3+ steps). Use for complex tasks "
-        "with 3+ steps or when the user provides multiple tasks. "
+        "Track a temporary in-session checklist only after applying any available "
+        "Kanban intake policy. Use for complex tasks with 3+ steps or when the user "
+        "provides multiple tasks only when the work does not need durable state, "
+        "multi-system coordination, a separate approval/review/monitoring phase, or "
+        "crash/interruption survival. Never substitute this checklist for a qualifying "
+        "Kanban card. "
         "For 'all N items' tasks, enumerate every instance as its own checklist "
         "item so none are silently dropped. "
         "Call with no parameters to read the current list.\n"
