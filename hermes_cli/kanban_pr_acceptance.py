@@ -14,18 +14,81 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_CONTRACT_HELP = ("completion_contract must be local-only, OWNER/REPO, an exact GitHub PR URL, "
+                  "or JSON with pr/repo plus non-empty checks")
 
 
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
         return "local-only"
-    if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
-        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
-    return value
+    if not isinstance(value, str):
+        raise ValueError(_CONTRACT_HELP)
+    if _REPO.fullmatch(value) or _PR.fullmatch(value):
+        return value
+    try:
+        contract = json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError(_CONTRACT_HELP) from None
+    target, checks = _validate_structured_contract(contract)
+    key = "pr" if _PR.fullmatch(target) else "repo"
+    return json.dumps({key: target, "checks": [
+        context if app_id is None else {"context": context, "app_id": app_id}
+        for context, app_id in checks
+    ]}, ensure_ascii=False, separators=(",", ":"))
+
+
+def _validate_structured_contract(contract: object) -> tuple[str, list[tuple[str, int | None]]]:
+    if not isinstance(contract, dict) or set(contract) not in ({"pr", "checks"}, {"repo", "checks"}):
+        raise ValueError(_CONTRACT_HELP)
+    target = contract.get("pr", contract.get("repo"))
+    matcher = _PR if "pr" in contract else _REPO
+    if not isinstance(target, str) or not matcher.fullmatch(target):
+        raise ValueError(_CONTRACT_HELP)
+    raw_checks = contract["checks"]
+    if not isinstance(raw_checks, list) or not raw_checks or len(raw_checks) > 100:
+        raise ValueError(_CONTRACT_HELP)
+    checks = []
+    for raw in raw_checks:
+        if isinstance(raw, str):
+            context, app_id = raw, None
+        elif isinstance(raw, dict) and set(raw) in ({"context"}, {"context", "app_id"}):
+            context, app_id = raw.get("context"), raw.get("app_id")
+            if "app_id" in raw and (isinstance(app_id, bool) or not isinstance(app_id, int) or app_id <= 0):
+                raise ValueError(_CONTRACT_HELP)
+        else:
+            raise ValueError(_CONTRACT_HELP)
+        if not isinstance(context, str) or not context.strip() or context != context.strip() or len(context) > 255:
+            raise ValueError(_CONTRACT_HELP)
+        checks.append((context, app_id))
+    if len(set(checks)) != len(checks):
+        raise ValueError("completion_contract checks must be unique")
+    return target, checks
+
+
+def _contract_spec(contract: str) -> tuple[str, set[tuple[str, int | None]]]:
+    if contract.startswith("{"):
+        target, checks = _validate_structured_contract(json.loads(contract))
+        return target, set(checks)
+    return contract, set()
+
+
+def bind_contract_to_pr(contract: str, published_pr: str) -> str | None:
+    """Bind an OWNER/REPO contract to its first exact PR, preserving checks."""
+    match = _PR.fullmatch(published_pr)
+    if not match:
+        return None
+    target, _ = _contract_spec(contract)
+    if _PR.fullmatch(target) or target != match[1]:
+        return None
+    if contract.startswith("{"):
+        value = json.loads(contract)
+        return validate_contract(json.dumps({"pr": published_pr, "checks": value["checks"]},
+                                            ensure_ascii=False))
+    return published_pr
 
 
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
@@ -34,7 +97,7 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
     if query is not None:
         command += ["-f", "query=" + query]
     if paginate:
-        command += ["--paginate", "--slurp"]
+        command.append("--paginate")
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=30,
@@ -45,20 +108,81 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # code + endpoint, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
         if denied:
-            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
+            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}",
+                                 status=int(denied[1])) from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
         raise
-    value = json.loads(result.stdout)
+    value = _decode_paginated(result.stdout) if paginate else json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
+
+
+def _decode_paginated(raw: str):
+    """Decode concatenated JSON documents emitted by ``gh api --paginate``."""
+    decoder = json.JSONDecoder()
+    pages = []
+    cursor = 0
+    while cursor < len(raw):
+        while cursor < len(raw) and raw[cursor].isspace():
+            cursor += 1
+        if cursor == len(raw):
+            break
+        page, cursor = decoder.raw_decode(raw, cursor)
+        pages.append(page)
+    if not pages:
+        raise ValueError("GitHub returned no paginated evidence")
+    return pages
+
+
+def _check_runs_from_pages(pages: object) -> list[dict]:
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("Missing check-run pages")
+    totals = []
+    runs = []
+    for page in pages:
+        if not isinstance(page, dict) or not {"total_count", "check_runs"} <= set(page):
+            raise ValueError("Malformed check-run page")
+        total = page["total_count"]
+        page_runs = page["check_runs"]
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0 or not isinstance(page_runs, list):
+            raise ValueError("Malformed check-run pagination metadata")
+        totals.append(total)
+        for run in page_runs:
+            app = run.get("app") if isinstance(run, dict) else None
+            if (not isinstance(run, dict) or isinstance(run.get("id"), bool) or
+                    not isinstance(run.get("id"), int) or not isinstance(run.get("name"), str) or
+                    not isinstance(run.get("head_sha"), str) or not isinstance(app, dict) or
+                    isinstance(app.get("id"), bool) or not isinstance(app.get("id"), int) or
+                    not isinstance(run.get("status"), str) or
+                    (run.get("conclusion") is not None and not isinstance(run.get("conclusion"), str))):
+                raise ValueError("Malformed check-run evidence")
+            runs.append(run)
+    if (len(set(totals)) != 1 or len(runs) != totals[0] or
+            len({run["id"] for run in runs}) != totals[0]):
+        raise ValueError("Incomplete check-run pagination")
+    return runs
+
+
+def _sanitize_receipt_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
 
 
 class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+    def __init__(self, message: str, *, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
@@ -112,10 +236,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
         profile_home = _assignee_profile_home(assignee)
-        declared = _PR.fullmatch(contract)
-        url = contract if declared else published_pr
+        target, explicit = _contract_spec(contract)
+        declared = _PR.fullmatch(target)
+        url = target if declared else published_pr
         match = _PR.fullmatch(url or "")
-        if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+        if not match or (not declared and match[1] != target) or (declared and published_pr and published_pr != target):
             receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
             return receipt
         repo, number = match[1], int(match[2])
@@ -134,23 +259,34 @@ def collect_acceptance(contract: str, published_pr: str | None,
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
-        required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
-        for page in rules:
-            for rule in page:
-                if rule["type"] == "required_status_checks":
-                    required.update((r["context"], r.get("integration_id"))
-                                    for r in rule["parameters"]["required_status_checks"])
+        required = set(explicit)
+        required.update((r["context"], (r.get("app") or {}).get("databaseId"))
+                        for r in protection.get("requiredStatusChecks", []))
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _GateAuthError as exc:
+            if exc.status != 403:
+                raise
+            if not explicit:
+                receipt.update(classification="policy_unavailable",
+                               detail="Repository rules endpoint returned HTTP 403 (plan/permissions may not include branch-protection rules). "
+                                      "Declare explicit required checks via a JSON completion_contract, then retry completion.")
+                return receipt
+            receipt["policy"] = "Repository rules unavailable (HTTP 403); enforcing explicitly declared checks."
+        else:
+            for page in rules:
+                for rule in page:
+                    if rule["type"] == "required_status_checks":
+                        required.update((r["context"], r.get("integration_id"))
+                                        for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
-        runs = [run for page in pages for run in page["check_runs"]]
-        if len({r["id"] for r in runs}) != pages[0]["total_count"]:
-            raise ValueError("Incomplete check-run pagination")
+        runs = _check_runs_from_pages(pages)
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         outcomes = []
@@ -169,7 +305,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 classification = _classify(check, sha, outcome, is_run)
                 outcomes.append(classification)
                 receipt["checks"].append({"name": context, "id": check["id"],
-                    "url": check.get("html_url") or check.get("target_url"),
+                    "url": _sanitize_receipt_url(check.get("html_url") or check.get("target_url")),
                     "head_sha": check.get("head_sha", check.get("sha")),
                     "classification": classification, "conclusion": outcome})
         # Re-read after all pages: old-head successes are never transferable.
@@ -186,9 +322,13 @@ def collect_acceptance(contract: str, published_pr: str | None,
                        detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
                               "fix that profile's GitHub credentials/access to the repository, then retry completion.")
         return receipt
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
-        # Never persist gh stderr (credentials/host details); the failed phase is actionable.
-        receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
+    except subprocess.CalledProcessError:
+        receipt.update(classification="infra",
+                       detail="gh CLI command failed; the installed gh version may not support the required API feature.")
+        return receipt
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, IndexError):
+        receipt.update(classification="infra",
+                       detail="GitHub acceptance evidence malformed or incomplete; retry and if persistent, report as a bug.")
         return receipt
 
 

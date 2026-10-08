@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_acceptance as acceptance
 from hermes_cli.kanban_db_connect import connect
 
 
@@ -20,28 +21,43 @@ def github(tmp_path, monkeypatch):
             state["requests"].append(self.path)
             sha = state["head"]
             if self.path == "/graphql":
+                protection = None if state.get("no_protection") else {
+                    "requiredStatusChecks": [{"context": "required", "app": {"databaseId": 1}}]}
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "baseRef": {"branchProtectionRule": protection}}}}}
+            elif "/rules/branches/" in self.path and state.get("rules_denied"):
+                self.send_error(403)
+                return
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
-                run = {"id": 42, "name": "required", "head_sha": sha,
-                       "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
-                       "html_url": "https://github.com/acme/repo/actions/runs/42"}
+                runs = [{"id": 42 + i, "name": context, "head_sha": sha,
+                         "app": {"id": 1},
+                         "status": "in_progress" if state["conclusion"] == "pending" else "completed",
+                         "conclusion": state["conclusion"],
+                         "html_url": f"https://github.com/acme/repo/actions/runs/{42 + i}"}
+                        for i, context in enumerate(state.get("required_names", ["required"]))]
                 if state.get("stale"):
-                    run["head_sha"] = "b" * 40
-                runs = [] if state.get("missing") else [run]
+                    for run in runs:
+                        run["head_sha"] = "b" * 40
+                if state.get("missing"):
+                    runs = []
+                optional = {"name": "optional", "head_sha": sha, "app": {"id": 1},
+                            "status": "completed", "conclusion": "skipped"}
                 value = [{"total_count": 100 + len(runs), "check_runs": [
-                    {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
-                    for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
+                    {**optional, "id": 1000 + i} for i in range(100)
+                ]}, {"total_count": 100 + len(runs), "check_runs": runs}]
+                if state.get("malformed_total"):
+                    value = [{"total_count": True, "check_runs": runs[:1]}]
                 if state.get("race"):
                     state["race"]()
                 if state.get("head_change"):
                     state["head"] = "b" * 40
             elif "/statuses" in self.path:
-                value = [[]]
+                value = [[{"id": 99, "context": "legacy", "state": "success",
+                           "target_url": "https://user:password@ci.example.test/build/9?token=secret#fragment"}]] \
+                    if state.get("legacy_status") else [[]]
             elif "/pulls/" in self.path:
                 value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
             else:
@@ -60,9 +76,18 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport json,sys,urllib.error,urllib.request\n"
+                  "if '--slurp' in sys.argv:\n"
+                  "    print('unknown flag: --slurp', file=sys.stderr); sys.exit(1)\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n"
+                  "    value=json.loads(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as exc:\n"
+                  "    print(f'gh: HTTP {exc.code}', file=sys.stderr); sys.exit(1)\n"
+                  "if '--paginate' in sys.argv:\n"
+                  "    print(''.join(json.dumps(page) for page in value))\n"
+                  "else:\n"
+                  "    print(json.dumps(value))\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -73,6 +98,176 @@ def github(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.platforms("posix")
+def test_paginated_api_does_not_require_gh_slurp(tmp_path, monkeypatch):
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys\n"
+                  "if '--slurp' in sys.argv:\n"
+                  "    print('unknown flag: --slurp', file=sys.stderr); sys.exit(1)\n"
+                  "print('[{\"id\": 1}][{\"id\": 2}]')\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    assert acceptance._api("repos/acme/repo/items", paginate=True) == [
+        [{"id": 1}], [{"id": 2}],
+    ]
+
+
+@pytest.mark.platforms("linux")
+def test_explicit_checks_are_exact_head_fallback_when_policy_is_unavailable(github):
+    contract = json.dumps({
+        "pr": "https://github.com/acme/repo/pull/7",
+        "checks": ["typecheck", {"context": "production build", "app_id": 1}],
+    })
+    github.update(no_protection=True, rules_denied=True,
+                  required_names=["typecheck", "production build"])
+    with connect() as conn:
+        tid = kb.create_task(conn, title="explicit", completion_contract=contract)
+        assert kb.complete_task(conn, tid, result="done", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7",
+        })
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+    assert receipt["ok"] is True
+    assert receipt["head_sha"] == "a" * 40
+    assert {check["name"] for check in receipt["checks"]} == {
+        "typecheck", "production build",
+    }
+    assert all(check["classification"] == "success" for check in receipt["checks"])
+
+    for fault, expected in (("missing", "missing"), ("stale", "stale")):
+        github[fault] = True
+        with connect() as conn:
+            tid = kb.create_task(conn, title=f"explicit-{fault}", completion_contract=contract)
+            assert not kb.complete_task(conn, tid, result="done", metadata={
+                "published_pr": "https://github.com/acme/repo/pull/7",
+            })
+            failed = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+            ).fetchone()[0])
+        assert failed["ok"] is False
+        assert expected in {check["classification"] for check in failed["checks"]}
+        github.pop(fault)
+
+
+def test_structured_contract_validation_and_canonicalization():
+    assert acceptance.validate_contract(json.dumps({
+        "repo": "acme/repo",
+        "checks": ["build", {"context": "lint", "app_id": 7}],
+    })) == '{"repo":"acme/repo","checks":["build",{"context":"lint","app_id":7}]}'
+    for invalid in (
+        {"pr": "https://github.com/acme/repo/pull/7", "checks": []},
+        {"repo": "acme/repo", "checks": ["duplicate", "duplicate"]},
+        {"repo": "acme/repo", "checks": [{"context": "build", "app_id": True}]},
+        {"repo": "acme/repo", "checks": [" padded"]},
+        {"repo": "acme/repo", "checks": ["build"], "extra": True},
+    ):
+        with pytest.raises(ValueError):
+            acceptance.validate_contract(json.dumps(invalid))
+
+
+@pytest.mark.platforms("linux")
+def test_structured_repo_contract_binds_once_to_first_published_pr(github):
+    contract = acceptance.validate_contract(json.dumps({"repo": "acme/repo", "checks": ["required"]}))
+    github["conclusion"] = "failure"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="bind structured repo", completion_contract=contract)
+        assert not kb.complete_task(conn, tid, result="failed", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7",
+        })
+        bound = kb.get_task(conn, tid).completion_contract
+        assert json.loads(bound) == {
+            "pr": "https://github.com/acme/repo/pull/7", "checks": ["required"],
+        }
+        github["conclusion"] = "success"
+        assert not kb.complete_task(conn, tid, result="sibling", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/8",
+        })
+        assert kb.get_task(conn, tid).completion_contract == bound
+
+
+@pytest.mark.platforms("linux")
+def test_rules_403_without_explicit_checks_is_policy_unavailable_not_auth(github):
+    github.update(no_protection=True, rules_denied=True, required_names=["required"])
+    with connect() as conn:
+        tid = kb.create_task(conn, title="no checks declared", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7",
+        })
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+    assert receipt["classification"] == "policy_unavailable"
+    assert "403" in receipt["detail"]
+    assert "JSON" in receipt["detail"]
+
+
+def test_duplicate_check_run_pages_fail_closed():
+    run = {"id": 42, "name": "required", "head_sha": "a" * 40,
+           "app": {"id": 1}, "status": "completed", "conclusion": "success"}
+    pages = [
+        {"total_count": 1, "check_runs": [run]},
+        {"total_count": 1, "check_runs": [dict(run)]},
+    ]
+    with pytest.raises(ValueError, match="Incomplete check-run pagination"):
+        acceptance._check_runs_from_pages(pages)
+
+
+@pytest.mark.platforms("linux")
+def test_malformed_check_run_pagination_fails_closed(github):
+    github["malformed_total"] = True
+    with connect() as conn:
+        tid = kb.create_task(conn, title="malformed pagination", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7",
+        })
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+    assert receipt["classification"] == "infra"
+
+
+@pytest.mark.platforms("linux")
+def test_explicit_non_success_check_fails_under_403_fallback(github):
+    contract = json.dumps({
+        "pr": "https://github.com/acme/repo/pull/7", "checks": ["required"],
+    })
+    github.update(no_protection=True, rules_denied=True,
+                  required_names=["required"], conclusion="neutral")
+    with connect() as conn:
+        tid = kb.create_task(conn, title="non-success check", completion_contract=contract)
+        assert not kb.complete_task(conn, tid, result="done", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7",
+        })
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["checks"][0]["classification"] != "success"
+    assert receipt["checks"][0]["conclusion"] == "neutral"
+
+
+@pytest.mark.platforms("linux")
+def test_legacy_status_receipt_strips_url_credentials_query_and_fragment(github):
+    contract = acceptance.validate_contract(json.dumps({
+        "pr": "https://github.com/acme/repo/pull/7", "checks": ["legacy"],
+    }))
+    github.update(no_protection=True, rules_denied=True, required_names=[], legacy_status=True)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="sanitize receipt", completion_contract=contract)
+        assert kb.complete_task(conn, tid, result="done", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7",
+        })
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+    assert receipt["checks"][0]["url"] == "https://ci.example.test/build/9"
+    assert "secret" not in json.dumps(receipt)
+    assert "password" not in json.dumps(receipt)
 
 
 @pytest.mark.platforms("linux")
