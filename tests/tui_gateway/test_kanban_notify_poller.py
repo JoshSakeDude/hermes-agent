@@ -249,6 +249,21 @@ class TestFormatKanbanEventText:
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
 
+    def test_iteration_exhaustion_names_queued_split_followup(self):
+        ev = SimpleNamespace(
+            kind="gave_up",
+            payload={
+                "reason_code": "iteration_budget_exhausted",
+                "budget_used": 45,
+                "budget_max": 45,
+                "followup_task_id": "t_split123",
+            },
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "iteration budget exhausted (45/45)" in text
+        assert "split follow-up t_split123 queued" in text
+        assert "no automatic retry" in text
+
 
 class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.

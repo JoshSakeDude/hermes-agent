@@ -167,6 +167,125 @@ def test_duplicate_exhaustion_is_ignored(kanban_home, monkeypatch):
         assert kb.get_task(conn, task_id).consecutive_failures == 1
 
 
+def test_split_callback_failure_cannot_roll_back_terminal_block(kanban_home):
+    task_id, run_id = _claim()
+
+    def fail_after_trip():
+        raise RuntimeError("split queue unavailable")
+
+    with kbc.connect_closing() as conn:
+        assert kbd._record_task_failure(
+            conn,
+            task_id,
+            error="Iteration budget exhausted (45/45)",
+            outcome="iteration_budget_exhausted",
+            force_trip=True,
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run_id,
+            event_payload_extra={
+                "reason_code": "iteration_budget_exhausted",
+                "retryable": False,
+            },
+            on_trip=fail_after_trip,
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        assert len(_events(conn, task_id, "gave_up")) == 1
+        run = conn.execute(
+            "SELECT outcome, ended_at FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        assert run["outcome"] == "gave_up"
+        assert run["ended_at"] is not None
+
+
+def test_exhaustion_creates_one_split_followup_with_origin_and_budget(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"orchestrator_profile": "planner"}},
+    )
+    task_id, run_id = _claim(
+        title="large card",
+        body="finish the remaining work",
+        tenant="tenant-a",
+        session_id="session-a",
+    )
+    _exhaust(
+        monkeypatch,
+        task_id,
+        run_id,
+        summary="completed the parser; API remains",
+    )
+
+    with kbc.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?", (f"split:{task_id}",),
+        ).fetchall()
+        assert len(rows) == 1
+        followup = rows[0]
+        assert followup["assignee"] == "planner"
+        assert followup["tenant"] == "tenant-a"
+        assert followup["session_id"] == "session-a"
+        assert followup["status"] == "ready"
+        assert "completed the parser; API remains" in followup["body"]
+        assert _events(conn, task_id, "split_followup_created") == [
+            {"followup_task_id": followup["id"]}
+        ]
+        gave_up = _events(conn, task_id, "gave_up")
+        assert gave_up[0]["followup_task_id"] == followup["id"]
+        metadata = json.loads(
+            conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()["metadata"]
+        )
+        assert metadata["followup_task_id"] == followup["id"]
+
+
+def test_split_card_exhaustion_does_not_recurse(kanban_home, monkeypatch):
+    task_id, run_id = _claim(idempotency_key="split:t_original")
+    _exhaust(monkeypatch, task_id, run_id)
+    with kbc.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM tasks WHERE idempotency_key = ?",
+            (f"split:{task_id}",),
+        ).fetchone()[0] == 0
+        assert _events(conn, task_id, "split_followup_skipped") == [
+            {"reason": "split_card"}
+        ]
+
+
+def test_split_child_exhaustion_does_not_recurse(kanban_home, monkeypatch):
+    with kbc.connect_closing() as conn:
+        split = kb.create_task(
+            conn,
+            title="split",
+            assignee="planner",
+            idempotency_key="split:t_original",
+        )
+        child = kb.create_task(
+            conn,
+            title="replacement",
+            assignee="worker",
+            creator_task_id=split,
+        )
+        claimed = kb.claim_task(conn, child)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = int(claimed.current_run_id)
+    _exhaust(monkeypatch, child, run_id)
+    with kbc.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM tasks WHERE idempotency_key = ?",
+            (f"split:{child}",),
+        ).fetchone()[0] == 0
+        assert _events(conn, child, "split_followup_skipped") == [
+            {"reason": "split_child"}
+        ]
+
+
 def test_create_split_followup_creates_one_linked_card_with_wake_text(
     kanban_home, monkeypatch
 ):

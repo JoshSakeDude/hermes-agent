@@ -667,9 +667,62 @@ def test_gateway_formats_iteration_budget_exhaustion_as_non_retryable():
     }
     text = _fmt_terminal("gave_up", payload)
     assert "iteration budget exhausted (45/45)" in text
-    assert "split the card" in text
+    assert "split needed" in text
     assert "no automatic retry" in text
     assert "spawn failures" not in text
+
+
+def test_iteration_budget_notification_names_queued_split_followup():
+    payload = {
+        "reason_code": "iteration_budget_exhausted",
+        "budget_used": 45,
+        "budget_max": 45,
+        "followup_task_id": "t_split123",
+    }
+    text = _fmt_terminal("gave_up", payload)
+    assert "t_split123" in text
+    assert "queued" in text.lower()
+    assert "iteration budget exhausted (45/45)" in text
+    assert "no automatic retry" in text
+
+
+def test_iteration_budget_wake_guidance_names_queued_split_followup():
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+
+    task = type(
+        "Task",
+        (),
+        {"title": "large task", "assignee": "worker", "session_id": "session-1"},
+    )()
+    event = type(
+        "Event",
+        (),
+        {
+            "kind": "gave_up",
+            "payload": {
+                "reason_code": "iteration_budget_exhausted",
+                "followup_task_id": "t_split123",
+            },
+        },
+    )()
+    sub = {
+        "task_id": "t_original",
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "thread_id": "",
+        "delivery_mode": "notify+wake",
+        "notifier_profile": "",
+    }
+    notification = _KanbanNotification(
+        type("Runner", (), {})(),
+        {"sub": sub, "task": task, "events": [event], "board": "default"},
+        platform_cls=None,
+        sub_fail_counts={},
+    )
+    notification.build_wake_text()
+    assert "t_split123" in notification.synth
+    assert "queued automatically" in notification.synth
+    assert "not a request to decompose" not in notification.synth
 
 
 def test_gateway_generic_gave_up_and_unknown_timeout_are_truthful():
