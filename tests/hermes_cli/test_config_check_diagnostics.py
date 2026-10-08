@@ -76,3 +76,20 @@ def test_config_check_reports_disabled_platform_only_when_runtime_disables_it(tm
         if reported:
             assert "hermes plugins enable platforms/fakechat" in output
         assert "synthetic-test-token" not in output
+
+
+def test_config_check_reports_legacy_kanban_shadowing_without_mutating_config(tmp_path, monkeypatch, capsys):
+    home = _write_home(
+        tmp_path / "shadowed",
+        "toolsets: [kanban]\n"
+        "platform_toolsets:\n"
+        "  cli: [file, kanban]\n"
+        "  telegram: [file]\n",
+    )
+    before = (home / "config.yaml").read_bytes()
+
+    output = _check(home, monkeypatch, capsys)
+
+    assert "explicit platform_toolsets selection(s) omit it for: telegram" in output
+    assert "add 'kanban' to them or remove the stale legacy opt-in" in output
+    assert (home / "config.yaml").read_bytes() == before
