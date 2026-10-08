@@ -1113,6 +1113,9 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    max_iterations = _opt_int(args.get("max_iterations"))
+    _check(max_iterations is None or max_iterations >= 1,
+           f"max_iterations must be >= 1 (got {max_iterations})")
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
@@ -1141,7 +1144,8 @@ def _handle_create(args: dict, **kw) -> str:
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
-            max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+            max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")),
+            max_iterations=max_iterations, skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),

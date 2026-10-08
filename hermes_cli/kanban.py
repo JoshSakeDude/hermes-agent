@@ -360,6 +360,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    max_iterations = getattr(args, "max_iterations", None)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
@@ -369,7 +370,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
+            max_retries=max_retries, max_iterations=max_iterations,
+            model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
@@ -525,6 +527,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
             print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
         else:
             print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+    if task.max_iterations is not None:
+        print(f"  max-iterations: {task.max_iterations} (task)")
+    else:
+        print("  max-iterations: inherits profile max_turns")
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.

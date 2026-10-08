@@ -468,6 +468,14 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "dispatcher SIGTERMs the worker and re-queues the "
                 "task with outcome='timed_out'."
         )),
+        "max_iterations": {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "Per-card agent iteration budget. Omit to inherit the profile's "
+                "max_turns."
+            ),
+        },
         "initial_status": {
             "type": "string",
             "enum": ["running", "blocked"],
