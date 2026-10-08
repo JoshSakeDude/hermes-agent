@@ -1350,10 +1350,13 @@ def _record_task_failure(
     outcome: str,
     failure_limit: int = None,
     force_trip: bool = False,
+    run_summary: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    on_trip: Optional[Callable[[], None]] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1375,7 +1378,11 @@ def _record_task_failure(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
-    error = error[:500]
+    error = str(_kb.redact_review_value(error or "worker failure"))[:500]
+    if run_summary is not None:
+        run_summary = str(_kb.redact_review_value(run_summary))
+    safe_extra = _kb.redact_review_value(event_payload_extra or {})
+    event_payload_extra = safe_extra if isinstance(safe_extra, dict) else {}
     with _kb.write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
@@ -1383,6 +1390,15 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+            return False
+        if expected_run_id is not None and end_run:
+            run_row = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if run_row is None or run_row["ended_at"] is not None:
+                return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -1419,7 +1435,8 @@ def _record_task_failure(
                 if infrastructure:
                     detail["infrastructure"] = True
                 run_id = _kb._end_run(
-                    conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
+                    conn, task_id, outcome=outcome, status=outcome,
+                    summary=run_summary, error=error, metadata=detail,
                 )
                 _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
             return False
@@ -1442,26 +1459,40 @@ def _record_task_failure(
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
+        terminal_extra = dict(event_payload_extra)
+        if force_trip:
+            terminal_extra["retryable"] = False
+        payload.update(terminal_extra)
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
+                summary=run_summary,
                 metadata={
                     "failures": failures,
                     "trigger_outcome": outcome,
                     "effective_limit": effective_limit,
                     "limit_source": limit_source,
                     "retry_status": retry_status,
+                    **terminal_extra,
                 },
             )
         if force_trip:
             # The caller applied its own bounded policy, so the counter cannot
             # judge this block: ``recompute_ready`` holds it for an operator.
             payload["sticky"] = True
-        if event_payload_extra:
-            payload.update(event_payload_extra)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+        if on_trip is not None:
+            # Follow-up work is best-effort. The terminal block is the safety
+            # invariant, so callback failure must not undo it.
+            try:
+                on_trip()
+            except Exception:
+                _kb._log.warning(
+                    "kanban failure trip callback failed for task %s", task_id,
+                    exc_info=True,
+                )
         return True
 
 
@@ -2771,7 +2802,10 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.append("chat")
+    if task.max_iterations is not None:
+        cmd.extend(["--max-turns", str(task.max_iterations)])
+    cmd.extend(["-q", f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd

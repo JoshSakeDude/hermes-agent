@@ -656,6 +656,8 @@ class Task:
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
     max_retries: Optional[int] = None
+    # Per-card agent-turn cap; None inherits the worker profile's ``agent.max_turns``.
+    max_iterations: Optional[int] = None
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
     # done / budget exhausted (-> kanban_block); ``goal_max_turns`` None -> goals default.
     goal_mode: bool = False
@@ -694,7 +696,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "max_iterations", "session_id", "completion_contract",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -870,6 +872,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
     -- config and then ``DEFAULT_FAILURE_LIMIT``.
     max_retries          INTEGER,
+    -- Per-task agent-turn budget. NULL inherits the worker profile's
+    -- agent.max_turns; exhaustion is a sticky, non-retryable card-size failure.
+    max_iterations       INTEGER,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -1190,7 +1195,7 @@ def create_task(
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
-    project_source_task_id: Optional[str] = None,
+    project_source_task_id: Optional[str] = None, max_iterations: Optional[int] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
 ) -> str:
@@ -1220,6 +1225,9 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    for _name, _value in (("max_iterations", max_iterations), ("max_retries", max_retries)):
+        if _value is not None and int(_value) < 1:
+            raise ValueError(f"{_name} must be >= 1 (got {_value})")
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1290,10 +1298,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, max_retries, max_iterations, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1301,7 +1309,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
-                        _opt_int(max_retries), model_override, provider_override, reasoning_effort,
+                        _opt_int(max_retries), _opt_int(max_iterations),
+                        model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
                 )
@@ -1353,6 +1362,133 @@ def create_task(
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
+
+
+def create_split_followup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    budget_used: int,
+    budget_max: int,
+    handoff_summary: Optional[str] = None,
+) -> Optional[str]:
+    """Queue one depth-bounded orchestrator card after budget exhaustion."""
+    with write_txn(conn, allow_nested=True):
+        original = conn.execute(
+            "SELECT id, title, body, assignee, tenant, session_id, idempotency_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if original is None:
+            return None
+
+        skip_reason = None
+        if str(original["idempotency_key"] or "").startswith("split:"):
+            skip_reason = "split_card"
+        else:
+            created = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            creator_id = _json_dict(created["payload"]).get("creator_task_id") if created else None
+            if creator_id:
+                creator = conn.execute(
+                    "SELECT idempotency_key FROM tasks WHERE id = ?", (creator_id,),
+                ).fetchone()
+                if creator and str(creator["idempotency_key"] or "").startswith("split:"):
+                    skip_reason = "split_child"
+
+        if skip_reason:
+            prior = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'split_followup_skipped' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if not prior:
+                _append_event(conn, task_id, "split_followup_skipped", {"reason": skip_reason})
+            return None
+
+        from hermes_cli.config import load_config_readonly
+
+        try:
+            cfg = load_config_readonly() or {}
+        except Exception:
+            cfg = {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        orchestrator = (
+            str(kanban_cfg.get("orchestrator_profile") or "").strip()
+            if isinstance(kanban_cfg, dict) else ""
+        ) or "default"
+
+        safe_title = str(redact_review_value(original["title"] or ""))
+        safe_body = str(redact_review_value(original["body"] or ""))[:4000]
+        safe_handoff = str(redact_review_value(handoff_summary or "(no worker handoff was captured)"))
+        body = f"""# Split oversized card
+
+Original card: {task_id} — {safe_title}
+Iteration budget: {int(budget_used)}/{int(budget_max)}
+Original assignee lane: {original['assignee'] or '(unassigned)'}
+
+## Original body (redacted, truncated to 4,000 characters)
+{safe_body or '(empty)'}
+
+## Worker handoff (redacted)
+{safe_handoff}
+
+## Required split procedure
+1. Read the original card, its runs and handoff, and any worktree or branch it used. Determine exactly what is done and what remains.
+2. Create small linked replacement cards for the remaining work only. Each card must have one deliverable and one stage, no more than four substantive steps, and fit well inside 45 turns. Use the original assignee lane and tenant. Give every code card its own worktree. Put a verification child on every card that changes live state.
+3. Never re-run or unblock the original. Never raise any iteration limit. Never duplicate finished work.
+4. Comment on the original with all replacement task IDs, then retire it as superseded.
+5. External, live, or customer-facing actions still require Josh's explicit approval.
+"""
+        followup_id = create_task(
+            conn,
+            title=f"Split oversized card {task_id}: {safe_title}",
+            body=body,
+            assignee=orchestrator,
+            created_by="dispatcher",
+            workspace_kind="scratch",
+            tenant=original["tenant"],
+            idempotency_key=f"split:{task_id}",
+            max_iterations=25,
+            goal_mode=False,
+            session_id=original["session_id"],
+            creator_task_id=task_id,
+        )
+
+        created_event = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'split_followup_created' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if not created_event:
+            _append_event(conn, task_id, "split_followup_created", {"followup_task_id": followup_id})
+
+        gave_up = conn.execute(
+            "SELECT id, run_id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'gave_up' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if gave_up:
+            payload = _json_dict(gave_up["payload"])
+            payload["followup_task_id"] = followup_id
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (_json_or_null(payload), gave_up["id"]),
+            )
+            if gave_up["run_id"] is not None:
+                run = conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?", (gave_up["run_id"],)
+                ).fetchone()
+                metadata = _json_dict(run["metadata"]) if run else {}
+                metadata["followup_task_id"] = followup_id
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (_json_or_null(metadata), gave_up["run_id"]),
+                )
+        return followup_id
 
 
 def _board_meta_for(board: Optional[str]) -> dict:
