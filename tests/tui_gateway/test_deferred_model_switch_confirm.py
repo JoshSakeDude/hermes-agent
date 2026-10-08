@@ -182,6 +182,38 @@ class TestLargeContextPickAsksBeforeStashing:
         assert result["deferred"] is True
         assert running_session["pending_model_switch"]["confirm_expensive_model"] is True
 
+    def test_confirmed_pick_commits_at_next_turn_start(
+        self, running_session, threshold, monkeypatch
+    ):
+        _live_agent(running_session, threshold)
+
+        result = _config_set_model(
+            UNGUARDED_MODEL, confirm_expensive_model=True
+        )["result"]
+        assert result["deferred"] is True
+        assert running_session["pending_model_switch"][
+            "confirm_expensive_model"
+        ] is True
+
+        applied = []
+
+        def _apply(sid, session, raw, **kwargs):
+            applied.append((sid, raw, kwargs["confirm_expensive_model"]))
+            session["agent"].model = UNGUARDED_MODEL
+            return {
+                "value": UNGUARDED_MODEL,
+                "confirm_required": False,
+                "warning": "",
+            }
+
+        monkeypatch.setattr(server, "_apply_model_switch", _apply)
+        running_session["running"] = False
+        server._apply_pending_model_switch("sid", running_session)
+
+        assert applied == [("sid", UNGUARDED_MODEL, True)]
+        assert running_session["agent"].model == UNGUARDED_MODEL
+        assert "pending_model_switch" not in running_session
+
     def test_session_under_the_threshold_defers_without_asking(self, running_session, threshold):
         _live_agent(running_session, threshold - 1)
 
