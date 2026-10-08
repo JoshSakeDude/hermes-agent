@@ -402,9 +402,11 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
         history = _visible_branch_history(display_history)
         if not history:
             return _err(rid, 4008, "send a message first")
-    # Only a chosen workspace persists as cwd; the launch-dir fallback is "No workspace"
-    # (#108205: the desktop arm lets the client vouch for a host-invisible path, #52589 provenance).
-    explicit_cwd, session_cwd, remote_cwd = _resolve_create_cwd(params, source, profile_home)
+    # Only a chosen workspace persists as cwd; the launch-dir fallback is "No workspace".
+    try:
+        explicit_cwd, session_cwd, remote_cwd = _resolve_create_cwd(params, source, profile_home)
+    except ValueError as exc:
+        return _err(rid, 4000, str(exc))
     _enable_gateway_prompts()
     from .methods_session_model_guard import create_overrides
     try:
