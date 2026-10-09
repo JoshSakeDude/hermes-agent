@@ -30,12 +30,14 @@ _SCALAR_TYPES = (str, int, float, bool)
 # Origin-first routing markers persisted inside ``delivery_metadata`` (no schema
 # change). ``route_*`` keys are internal bookkeeping and are stripped before any
 # adapter send. ``route_role``: "origin" (the exact conversation that created the
-# card), "fallback" (the single notify-only home-channel row created after the
-# origin is permanently unreachable) or "mirror"; unstamped rows are classified
+# card), "fallback" (the single notify-only Alerts row created after the origin
+# delivery fails or a Desktop update stays unread) or "mirror"; unstamped rows are classified
 # by ``gateway.kanban_notify_routing.sub_role``.
 ROUTE_ROLE_KEY = "route_role"
 ROUTE_FAILURES_KEY = "route_failures"
 ROUTE_ORIGIN_KEY = "route_origin"
+ROUTE_FALLBACK_CAUSE_KEY = "route_fallback_cause"
+FALLBACK_CAUSE_DESKTOP_UNREAD = "desktop_unread"
 ROLE_ORIGIN, ROLE_MIRROR, ROLE_FALLBACK = "origin", "mirror", "fallback"
 ROLE_ALERTS, ROLE_APPROVALS, ROLE_OPS = "alerts", "approvals", "ops"
 FALLBACK_SENT_EVENT = "fallback_sent"
@@ -499,6 +501,7 @@ def ensure_fallback_notify_sub(
     notifier_profile: Optional[str] = None,
     start_cursor: int,
     origin: str,
+    cause: Optional[str] = None,
 ) -> bool:
     """Create the task's single notify-only fallback row; False when one already exists.
 
@@ -508,7 +511,8 @@ def ensure_fallback_notify_sub(
     place — its cursor is moved to ``start_cursor`` so the first unacknowledged
     actionable event is delivered, and its mode is forced to ``notify`` so the
     fallback never wakes a conversation. ``origin`` (``platform:chat[:thread]``) is
-    recorded so the ping names the conversation that could not be reached.
+    recorded so the ping names the originating conversation. ``cause`` distinguishes
+    a stale Desktop update from an actual delivery failure without changing the schema.
     """
     key = _sub_key(task_id, platform, chat_id, thread_id)
     start = int(start_cursor)
@@ -527,6 +531,8 @@ def ensure_fallback_notify_sub(
         meta = _decode_notify_delivery_metadata(existing["delivery_metadata"]) if existing is not None else {}
         meta.pop(ROUTE_FAILURES_KEY, None)
         meta.update({ROUTE_ROLE_KEY: ROLE_FALLBACK, ROUTE_ORIGIN_KEY: str(origin)[:200]})
+        if cause:
+            meta[ROUTE_FALLBACK_CAUSE_KEY] = str(cause)[:80]
         metadata_json = _encode_notify_delivery_metadata(meta)
         if existing is None:
             conn.execute(

@@ -24,7 +24,12 @@ from gateway.kanban_watchers_common import (
     _to_thread_process_service,
     logger,
 )
-from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
+from gateway.kanban_watchers_notifier import (
+    _KanbanFallbackDigest,
+    _KanbanNotification,
+    _notification_batches,
+    _notifier_collect,
+)
 from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
@@ -61,8 +66,9 @@ class GatewayKanbanWatchersMixin:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         Per subscription, claims ``task_events`` newer than the stored cursor
-        (kinds in TERMINAL_KINDS), sends one message per event, then advances
-        the cursor. The subscription is removed only when the task is
+        (kinds in TERMINAL_KINDS), sends urgent events individually and groups
+        routine Desktop-unread completions into bounded destination digests, then
+        advances the cursor. The subscription is removed only when the task is
         ``archived``: ``done`` is reversible, so the cursor — not unsubscribing
         — is the dedup mechanism (unsub-on-terminal dropped users when the
         dispatcher respawned a crashed task). All SQLite work runs in a thread;
@@ -117,10 +123,15 @@ class GatewayKanbanWatchersMixin:
                     _notifier_collect, self, _kb,
                     notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
                 )
-                for d in deliveries:
-                    await _KanbanNotification(
-                        self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
-                    ).deliver()
+                for batch in _notification_batches(deliveries):
+                    if len(batch) > 1:
+                        await _KanbanFallbackDigest(
+                            self, batch, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
+                        ).deliver()
+                    else:
+                        await _KanbanNotification(
+                            self, batch[0], platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
+                        ).deliver()
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)

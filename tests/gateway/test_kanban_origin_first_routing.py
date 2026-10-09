@@ -164,6 +164,15 @@ def _age_events(tid, seconds):
         conn.close()
 
 
+def _set_event_created_at(tid, created_at):
+    conn = kbc.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?", (created_at, tid))
+    finally:
+        conn.close()
+
+
 def _subs(tid):
     conn = kbc.connect()
     try:
@@ -253,6 +262,85 @@ def test_stale_desktop_origin_creates_one_notify_only_fallback(board, monkeypatc
     assert "tui" in text and DESKTOP_KEY in text  # original card/session identity
     assert ROUTE_ROLE_KEY not in adapter.sent[0]["metadata"]
     assert adapter.handled == []  # fallback never wakes a conversation
+
+
+def test_stale_desktop_completions_share_one_alerts_digest(board, monkeypatch):
+    task_ids = []
+    for title in ("first desktop card", "second desktop card"):
+        tid = _task(title=title)
+        task_ids.append(tid)
+        _desktop_origin(tid)
+        _complete(tid, summary=f"finished {title}")
+        _age_events(tid, 3600)
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert _sent_destinations(adapter) == [(OPS_CHAT, TOPICS["alerts"])]
+    text = adapter.sent[0]["text"]
+    assert all(tid in text for tid in task_ids)
+    assert "first desktop card" in text and "second desktop card" in text
+    assert "Desktop update unread" in text
+    assert "origin unreachable" not in text
+
+
+def test_urgent_alert_bypasses_digest_while_completions_wait_ten_minutes(board, monkeypatch):
+    now = [10_000]
+    monkeypatch.setattr("gateway.kanban_notify_routing.time.time", lambda: now[0])
+    monkeypatch.setattr("gateway.kanban_watchers_notifier.time.time", lambda: now[0])
+    completion_ids = []
+    for title in ("timed first", "timed second"):
+        tid = _task(title=title)
+        completion_ids.append(tid)
+        _desktop_origin(tid)
+        _complete(tid)
+        _set_event_created_at(tid, 9_400)
+    urgent = _task(title="blocked now")
+    _desktop_origin(urgent)
+    _event(urgent, "blocked", {"kind": "capability", "reason": "credentials missing"})
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    now[0] = 9_999
+    _tick(monkeypatch, runner, n=2)
+
+    assert len(adapter.sent) == 1
+    assert urgent in adapter.sent[0]["text"]
+    assert all(tid not in adapter.sent[0]["text"] for tid in completion_ids)
+    assert _sent_destinations(adapter) == [(OPS_CHAT, TOPICS["alerts"])]
+
+    now[0] = 10_000
+    _tick(monkeypatch, runner, n=2)
+
+    assert len(adapter.sent) == 2
+    digest = adapter.sent[1]["text"]
+    assert all(tid in digest for tid in completion_ids)
+    assert "Desktop update unread" in digest
+    assert "origin unreachable" not in digest
+    assert _sent_destinations(adapter)[1] == (OPS_CHAT, TOPICS["alerts"])
+
+
+def test_desktop_completion_digest_is_bounded(board, monkeypatch):
+    from gateway.kanban_watchers_notifier import MAX_FALLBACK_DIGEST_ITEMS
+
+    task_ids = []
+    for index in range(MAX_FALLBACK_DIGEST_ITEMS + 1):
+        tid = _task(title=f"bounded card {index}")
+        task_ids.append(tid)
+        _desktop_origin(tid)
+        _complete(tid)
+        _age_events(tid, 3600)
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert len(adapter.sent) == 2
+    assert all(
+        (sent["chat_id"], sent["metadata"].get("thread_id")) == (OPS_CHAT, TOPICS["alerts"])
+        for sent in adapter.sent
+    )
+    combined = "\n".join(sent["text"] for sent in adapter.sent)
+    assert all(tid in combined for tid in task_ids)
 
 
 def test_archived_stale_desktop_origin_never_loops_fallback(board, monkeypatch):
@@ -528,6 +616,8 @@ def test_permanent_origin_failure_creates_single_fallback(board, monkeypatch):
     assert [s["chat_id"] for s in adapter.sent] == [OPS_CHAT]
     text = adapter.sent[0]["text"]
     assert tid in text and "topic card" in text and ORIGIN_CHAT in text
+    assert "origin unreachable" in text
+    assert "Desktop update unread" not in text
     assert adapter.handled == []
     # The dead origin row is retired so it stops spinning.
     assert not [s for s in _subs(tid) if s["chat_id"] == ORIGIN_CHAT]

@@ -16,8 +16,9 @@ Under ``origin_first``:
 * **Exactly one fallback.** After ``MAX_SEND_FAILURES`` consecutive origin failures —
   or a Desktop origin leaving an actionable event unclaimed for longer than
   ``kanban.origin_stale_seconds`` (default 600s) — one notify-only row is created in the
-  configured Gohan Ops Alerts topic. It never wakes a conversation and names the card and
-  the unreachable origin. Dedup is per task; the Telegram home DM is never a fallback.
+  configured Gohan Ops Alerts topic. It never wakes a conversation. Delivery failures say
+  the origin was unreachable; Desktop misses say the update was unread. Routine Desktop
+  completions share a bounded digest. Dedup is per task; the Telegram home DM is never a fallback.
 * **Internal events are silent.** Heartbeats, claims, spawns, promotions, dependency
   waits, routine status/review churn and auto-retried crashes/timeouts never reach Josh;
   only completion, real blocks (incl. ``status→blocked``), give-ups and triage escalations do.
@@ -29,12 +30,14 @@ import time
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_db_notify import (
+    FALLBACK_CAUSE_DESKTOP_UNREAD,
     ROLE_ALERTS,
     ROLE_APPROVALS,
     ROLE_FALLBACK,
     ROLE_MIRROR,
     ROLE_OPS,
     ROLE_ORIGIN,
+    ROUTE_FALLBACK_CAUSE_KEY,
     ROUTE_FAILURES_KEY,
     ROUTE_ORIGIN_KEY,
     ROUTE_ROLE_KEY,
@@ -154,11 +157,16 @@ def describe_origin(sub: dict) -> str:
 
 
 def strip_route_metadata(metadata: dict) -> dict:
-    return {k: v for k, v in metadata.items() if k not in (ROUTE_ROLE_KEY, ROUTE_FAILURES_KEY, ROUTE_ORIGIN_KEY)}
+    return {k: v for k, v in metadata.items() if k not in (
+        ROUTE_ROLE_KEY, ROUTE_FAILURES_KEY, ROUTE_ORIGIN_KEY, ROUTE_FALLBACK_CAUSE_KEY,
+    )}
 
 
 def fallback_prefix(sub: dict) -> str:
-    origin = _meta(sub).get(ROUTE_ORIGIN_KEY)
+    metadata = _meta(sub)
+    origin = metadata.get(ROUTE_ORIGIN_KEY)
+    if metadata.get(ROUTE_FALLBACK_CAUSE_KEY) == FALLBACK_CAUSE_DESKTOP_UNREAD:
+        return f"↪ Desktop update unread ({origin}). " if origin else "↪ Desktop update unread. "
     return f"↪ Fallback — origin unreachable ({origin}). " if origin else "↪ Fallback — origin unreachable. "
 
 

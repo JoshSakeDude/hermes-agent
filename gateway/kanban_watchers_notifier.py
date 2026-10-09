@@ -524,7 +524,8 @@ class _Collector:
                 continue
             seen.add(tid)
             if kbn.ensure_fallback_notify_sub(conn, task_id=tid, start_cursor=ev.id - 1,
-                                               origin=_routing.describe_origin(desk), **target):
+                                               origin=_routing.describe_origin(desk),
+                                               cause=kbn.FALLBACK_CAUSE_DESKTOP_UNREAD, **target):
                 logger.warning("kanban notifier: desktop origin %s left %s %s unacknowledged; created "
                                "telegram fallback", _routing.describe_origin(desk), tid, ev.kind)
                 self._subs_by_task.clear()
@@ -578,6 +579,42 @@ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], 
     return _Collector(
         runner, kb, notifier_profile=notifier_profile, gc_due=gc_due, gc_retention_days=gc_retention_days,
     ).collect()
+
+
+# Six worst-case lines (title + summary + origin) stay below Telegram's 4,096-character limit.
+MAX_FALLBACK_DIGEST_ITEMS = 6
+
+
+def _is_desktop_completion_fallback(delivery: dict) -> bool:
+    metadata = delivery["sub"].get("delivery_metadata") or {}
+    events = delivery.get("events") or []
+    return (
+        delivery.get("role") == _routing.ROLE_FALLBACK
+        and metadata.get(_kbn().ROUTE_FALLBACK_CAUSE_KEY) == _kbn().FALLBACK_CAUSE_DESKTOP_UNREAD
+        and len(events) == 1
+        and events[0].kind == "completed"
+    )
+
+
+def _notification_batches(deliveries: list[dict]) -> list[list[dict]]:
+    """Keep urgent notifications individual and put routine completions in bounded destination batches."""
+    batches = [[delivery] for delivery in deliveries if not _is_desktop_completion_fallback(delivery)]
+    grouped: dict[tuple, list[dict]] = {}
+    for delivery in deliveries:
+        if not _is_desktop_completion_fallback(delivery):
+            continue
+        sub = delivery["sub"]
+        key = (
+            (sub.get("platform") or "").lower(), sub.get("chat_id"), sub.get("thread_id") or "",
+            sub.get("notifier_profile") or "",
+        )
+        grouped.setdefault(key, []).append(delivery)
+    for group in grouped.values():
+        batches.extend(
+            group[index:index + MAX_FALLBACK_DIGEST_ITEMS]
+            for index in range(0, len(group), MAX_FALLBACK_DIGEST_ITEMS)
+        )
+    return batches
 
 
 # --- Per-event message formatting: kind -> (msg, wake_handoff, wake_review_detail) ---
@@ -1131,3 +1168,92 @@ class _KanbanNotification:
         # Unsubscribe only on archive; ``done`` is reversible.
         if self.task and self.task.status == "archived":
             await self.unsub()
+
+
+class _KanbanFallbackDigest:
+    """Deliver one bounded batch of routine Desktop-unread completion fallbacks."""
+
+    def __init__(self, runner: Any, deliveries: list[dict], *, platform_cls: Any, sub_fail_counts: dict) -> None:
+        self.notifications = [
+            _KanbanNotification(runner, delivery, platform_cls=platform_cls, sub_fail_counts=sub_fail_counts)
+            for delivery in deliveries
+        ]
+        self.runner = runner
+
+    def _text(self) -> str:
+        lines = [f"{len(self.notifications)} completed cards:"]
+        for notification in self.notifications:
+            event = notification.d["events"][0]
+            summary = _payload(event, "summary") or (notification.task.result if notification.task else "")
+            detail = f" — {_first_line(str(summary), 160)}" if summary else ""
+            origin = (notification.sub.get("delivery_metadata") or {}).get(_kbn().ROUTE_ORIGIN_KEY)
+            source = f" [{origin}]" if origin else ""
+            lines.append(f"• {notification.task_id} {notification.title}{detail}{source}")
+        return "\n".join(lines)
+
+    async def _prepare(self) -> Optional[Any]:
+        adapter = None
+        for notification in self.notifications:
+            try:
+                notification.plat = notification.platform_cls(notification.platform_str)
+            except ValueError:
+                for pending in self.notifications:
+                    await pending.advance()
+                return None
+            resolved = await asyncio.to_thread(
+                _adapter_for_subscription, self.runner, notification.plat,
+                notification.sub, notification.sub_profile or None,
+            )
+            if resolved is None or (adapter is not None and resolved is not adapter):
+                for pending in self.notifications:
+                    await pending.rewind()
+                return None
+            adapter = resolved
+            notification.adapter = resolved
+            notification.is_push_adapter = True
+        return adapter
+
+    async def deliver(self) -> None:
+        adapter = await self._prepare()
+        if adapter is None:
+            return
+        first = self.notifications[0]
+        try:
+            async with first._owner_scope():
+                if await first._send_event(first.d["events"][0], self._text()) is False:
+                    for notification in self.notifications:
+                        await notification.rewind()
+                    return
+                delivery_metadata = first.sub.get("delivery_metadata")
+                metadata = _routing.strip_route_metadata(
+                    dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {})
+                if first.sub.get("thread_id") and not metadata.get("thread_id"):
+                    metadata["thread_id"] = first.sub["thread_id"]
+                for notification in self.notifications[1:]:
+                    try:
+                        await self.runner._deliver_kanban_artifacts(
+                            adapter=adapter, chat_id=notification.sub["chat_id"], metadata=metadata,
+                            event_payload=notification.d["events"][0].payload, task=notification.task,
+                        )
+                    except Exception as art_exc:  # health: allow BLE001 -- artifact adapters raise provider-specific errors; text delivery remains successful
+                        logger.debug("kanban notifier: digest artifact delivery for %s failed: %s",
+                                     notification.task_id, art_exc)
+        except Exception as exc:  # health: allow BLE001 -- adapter errors are provider-specific; every claimed member is settled below
+            for notification in self.notifications:
+                await notification.delivery_failed(
+                    "kanban notifier: digest send failed for %s on %s (attempt %d/%d): %s",
+                    (notification.task_id, notification.platform_str),
+                    "kanban notifier: dropping subscription %s on %s after %d consecutive send failures",
+                    exc, False,
+                )
+            return
+        for notification in self.notifications:
+            event = notification.d["events"][0]
+            await _to_thread_process_service(partial(
+                self.runner._kanban_sub_op, notification.board_slug, "record_notify_ping", notification.sub,
+                event_id=event.id,
+            ))
+            await _to_thread_process_service(partial(
+                self.runner._kanban_sub_op, notification.board_slug, "record_fallback_sent", notification.sub))
+            await notification.advance()
+            notification.clear_failures()
