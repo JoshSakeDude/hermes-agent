@@ -5,6 +5,133 @@ import sqlite3
 import time
 from typing import Any, Optional
 
+
+def reconcile_split_dependencies(
+    conn: sqlite3.Connection,
+    original_task_id: str,
+    downstream_replacements: dict[str, list[str]],
+) -> int:
+    """Replace an exhausted card's outgoing edges with explicit split results.
+
+    Every direct downstream child must be named exactly once. Replacement cards
+    must be completed children of the split follow-up created for ``original``.
+    Validation and graph mutation share one transaction, so a rejected handoff
+    cannot leave a partially rewritten dependency graph.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    if not isinstance(downstream_replacements, dict) or not downstream_replacements:
+        raise ValueError("downstream_replacements must explicitly map every downstream task")
+
+    with _kb.write_txn(conn):
+        original = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (original_task_id,),
+        ).fetchone()
+        if original is None:
+            raise ValueError(f"unknown original task: {original_task_id}")
+        exhausted = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'gave_up' "
+            "ORDER BY id DESC LIMIT 1",
+            (original_task_id,),
+        ).fetchone()
+        exhausted_payload = _kb._json_dict(exhausted["payload"]) if exhausted else {}
+        if exhausted_payload.get("reason_code") != "iteration_budget_exhausted":
+            raise ValueError(f"task {original_task_id} did not exhaust its iteration budget")
+
+        split_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'split_followup_created' ORDER BY id DESC LIMIT 1",
+            (original_task_id,),
+        ).fetchone()
+        split_id = (_kb._json_dict(split_event["payload"]).get("followup_task_id")
+                    if split_event else None)
+        if not split_id:
+            raise ValueError(f"task {original_task_id} has no split follow-up")
+
+        downstream_ids = _kb.child_ids(conn, original_task_id)
+        mapped_ids = list(downstream_replacements)
+        if set(mapped_ids) != set(downstream_ids) or len(mapped_ids) != len(downstream_ids):
+            missing = sorted(set(downstream_ids) - set(mapped_ids))
+            extra = sorted(set(mapped_ids) - set(downstream_ids))
+            raise ValueError(
+                "ambiguous downstream mapping: every direct child must be mapped exactly once"
+                f" (missing={missing}, extra={extra})"
+            )
+
+        normalized: dict[str, list[str]] = {}
+        for downstream_id, raw_replacements in downstream_replacements.items():
+            if not isinstance(raw_replacements, list) or not raw_replacements:
+                raise ValueError(f"{downstream_id} must map to at least one replacement task")
+            replacement_ids = [str(task_id).strip() for task_id in raw_replacements]
+            if any(not task_id for task_id in replacement_ids) or len(set(replacement_ids)) != len(replacement_ids):
+                raise ValueError(f"{downstream_id} has blank or duplicate replacement task ids")
+            normalized[downstream_id] = replacement_ids
+
+            downstream = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (downstream_id,),
+            ).fetchone()
+            if downstream["status"] == "running":
+                raise ValueError(f"cannot re-parent running downstream task {downstream_id}")
+            if downstream["status"] in ("blocked", "review"):
+                raise ValueError(f"cannot re-parent approval-gated downstream task {downstream_id}")
+
+            for replacement_id in replacement_ids:
+                replacement = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (replacement_id,),
+                ).fetchone()
+                if replacement is None:
+                    raise ValueError(f"unknown replacement task: {replacement_id}")
+                if replacement["status"] not in ("done", "archived"):
+                    raise ValueError(f"replacement task {replacement_id} is not completed")
+                created = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+                    "ORDER BY id LIMIT 1",
+                    (replacement_id,),
+                ).fetchone()
+                creator_id = _kb._json_dict(created["payload"]).get("creator_task_id") if created else None
+                if creator_id != split_id:
+                    raise ValueError(
+                        f"replacement task {replacement_id} was not created by split follow-up {split_id}"
+                    )
+        now = int(time.time())
+        for downstream_id, replacement_ids in normalized.items():
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (original_task_id, downstream_id),
+            )
+            for replacement_id in replacement_ids:
+                if _kb._would_cycle(conn, replacement_id, downstream_id):
+                    raise ValueError(
+                        f"linking {replacement_id} -> {downstream_id} would create a cycle"
+                    )
+                _kb._link(conn, replacement_id, downstream_id)
+            _kb._append_event(
+                conn,
+                downstream_id,
+                "split_dependency_reconciled",
+                {
+                    "original_parent": original_task_id,
+                    "replacement_parents": replacement_ids,
+                },
+            )
+            unsatisfied = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (downstream_id,),
+            ).fetchone()
+            if not unsatisfied:
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                    (downstream_id,),
+                )
+        _kb._append_event(
+            conn,
+            original_task_id,
+            "split_dependencies_reconciled",
+            {"mapping": normalized, "split_followup_task_id": split_id, "reconciled_at": now},
+        )
+    return len(normalized)
+
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
     created_at: int,
