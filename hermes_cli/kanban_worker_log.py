@@ -26,8 +26,8 @@ def _read_worker_log(task_id: str, board: Optional[str]) -> Optional[str]:
 
 
 def worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
-    """Return the last durable worker exit code in the append-mode task log."""
-    matches = _EXIT_TRAILER_RE.findall(_read_worker_log(task_id, board) or "")
+    """Return the current attempt's durable worker exit code, when present."""
+    matches = _EXIT_TRAILER_RE.findall(_current_attempt(_read_worker_log(task_id, board) or ""))
     return int(matches[-1]) if matches else None
 
 

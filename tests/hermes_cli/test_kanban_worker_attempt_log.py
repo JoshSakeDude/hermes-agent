@@ -9,6 +9,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 
 @pytest.fixture
@@ -65,3 +66,48 @@ def test_repeated_worker_attempts_scope_gave_up_output_to_latest_append_log(
 
     assert error.count("Worker's last output") == 1
     assert error.count(diagnostic) == 1
+
+
+def test_retry_without_exit_trailer_ignores_previous_attempt_trailer(
+    kanban_home, monkeypatch,
+):
+    """A killed retry cannot inherit an earlier attempt's exit classification."""
+    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda _pid: ("unknown", None))
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale exit trailer", assignee="default")
+        first = kb.claim_task(conn, tid)
+        assert first is not None
+        first_log = kbd._open_worker_log(first, board=None)
+        first_log.write(
+            f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE}\n".encode()
+        )
+        first_log.close()
+        assert not kbd._record_task_failure(
+            conn,
+            tid,
+            error="first attempt failed",
+            outcome="crashed",
+            failure_limit=3,
+            expected_run_id=first.current_run_id,
+            release_claim=True,
+            end_run=True,
+        )
+
+        second = kb.claim_task(conn, tid)
+        assert second is not None
+        second_log = kbd._open_worker_log(second, board=None)
+        second_log.write(b"partial output before kill\n")
+        second_log.close()
+
+        dead = kbd._classify_dead_worker(
+            999999,
+            second.claim_lock,
+            task_id=tid,
+            board=None,
+        )
+
+    assert dead.kind == "unknown"
+    assert dead.code is None
+    assert dead.rate_limited is False
+    assert dead.event_kind == "crashed"
