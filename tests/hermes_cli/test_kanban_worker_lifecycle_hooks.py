@@ -96,6 +96,39 @@ def test_dispatch_spawn_fires_worker_spawned(
     assert "board" in kw
     assert pid_at_fire_time == [4242]
 
+
+def test_stale_optional_pid_callback_cannot_fire_success_hook(
+    kanban_home, all_assignees_spawnable, captured_hooks,
+):
+    """A None-PID callback from run N cannot report success for run N+1."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="optional pid race", assignee="alice")
+
+        def stale_spawn(*args, **kwargs):
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            old_run = task.current_run_id
+            with kb.write_txn(conn):
+                kb._end_run(conn, tid, outcome="crashed", status="crashed", error="old")
+                conn.execute(
+                    "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                    (tid,),
+                )
+            successor = kb.claim_task(conn, tid)
+            assert successor is not None and successor.current_run_id != old_run
+            return None
+
+        result = kbd.dispatch_once(conn, spawn_fn=stale_spawn)
+        task = kb.get_task(conn, tid)
+        assert result.spawned == []
+        assert task is not None and task.status == "running"
+    finally:
+        conn.close()
+
+    fired = [e for e in captured_hooks if e[0] == "on_kanban_worker_spawned"]
+    assert fired == []
+
 def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypatch):
     """A dead-PID reclaim fires the exit observer with the exit facts."""
     conn = kbc.connect()

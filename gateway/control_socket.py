@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import socket
+import struct
 import sys
 import tempfile
 import time
@@ -104,6 +105,10 @@ def build_identify_payload() -> dict[str, Any]:
         **{k: record.get(k) for k in ("kind", "pid", "start_time", "hermes_home")},
         "profile": _profile_label_for_home(record.get("hermes_home") or ""),
         "supervisor": _detect_supervisor(), **_get_code_identity_fields()}
+    with contextlib.suppress(Exception):
+        from gateway.code_skew import _PROJECT_ROOT, boot_code_sha
+        payload["boot_code_sha"] = boot_code_sha()
+        payload["boot_repo"] = str(_PROJECT_ROOT)
     with contextlib.suppress(Exception):
         # served_profiles (multiplex mode) is stamped into runtime status by the runner.
         served = (read_runtime_status() or {}).get("served_profiles")
@@ -287,6 +292,38 @@ def query_gateway_control(home: Path, verb: str, *, params: Optional[dict[str, A
         return None
     result = response.get("result") if isinstance(response, dict) and response.get("ok") is True else None
     return result if isinstance(result, dict) else None
+
+
+def identify_gateway_with_peer_pid(
+    home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+) -> Optional[tuple[dict[str, Any], int]]:
+    """Identify over a Unix socket and bind the claim to OS peer credentials.
+
+    This is intentionally Linux-only: the promotion contract currently runs on
+    Linux and must fail closed where ``SO_PEERCRED`` is unavailable.
+    """
+    if _IS_WINDOWS or not hasattr(socket, "SO_PEERCRED"):
+        return None
+    path = resolve_client_socket_path(home)
+    if path is None:
+        return None
+    request = json.dumps({
+        "verb": "identify", "id": 1, "protocol": CONTROL_PROTOCOL_VERSION,
+    }).encode("utf-8") + b"\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(path))
+            peer_pid, _uid, _gid = struct.unpack(
+                "3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")),
+            )
+            sock.sendall(request)
+            raw = _read_response_line(lambda: sock.recv(65536), time.monotonic() + timeout)
+        response = json.loads(raw.decode("utf-8")) if raw else None
+        result = response.get("result") if isinstance(response, dict) and response.get("ok") is True else None
+        return (result, int(peer_pid)) if isinstance(result, dict) else None
+    except Exception:
+        return None
 
 
 def _read_response_line(read: Callable[[], bytes], deadline: float) -> Optional[bytes]:

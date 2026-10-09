@@ -18,6 +18,7 @@ import time
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway import kanban_watchers_notifier as notifier
 from gateway.kanban_notify_routing import ROUTE_ROLE_KEY
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
@@ -182,6 +183,35 @@ def _topic_rows(tid, role):
 
 def _sent_destinations(adapter):
     return [(s["chat_id"], s["metadata"].get("thread_id")) for s in adapter.sent]
+
+
+def test_superseded_event_is_rechecked_before_wake(board, monkeypatch):
+    """A successor beginning after the passive ping suppresses the stale wake."""
+    tid = _task(title="wake race")
+    _sub(
+        tid, platform="telegram", chat_id=ORIGIN_CHAT, user_id=ORIGIN_CHAT,
+        chat_type="dm", notifier_profile="default", delivery_mode="notify+wake",
+        delivery_metadata=_origin_meta(),
+    )
+    _complete(tid)
+
+    checks = 0
+
+    def current_then_superseded(self, event):
+        nonlocal checks
+        checks += 1
+        # Ping check + pre-format check pass; transport admission loses the race.
+        return checks <= 2
+
+    monkeypatch.setattr(
+        notifier._KanbanNotification, "_event_is_still_current", current_then_superseded,
+    )
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter))
+
+    assert len(adapter.sent) == 1
+    assert adapter.handled == []
+    assert checks >= 3
 
 
 # --- Desktop origin ---------------------------------------------------------
@@ -386,6 +416,85 @@ def test_desktop_origin_failures_route_once_to_alerts_never_fred(board, monkeypa
     assert len(_topic_rows(tid, "alerts")) == 1
     assert tid in adapter.sent[0]["text"] and "tui" in adapter.sent[0]["text"]
     assert adapter.handled == []
+
+
+def test_superseded_run_failure_is_silent_when_newer_run_is_active(board, monkeypatch):
+    """A delayed failure from an older run must not describe a healthy successor."""
+    tid = _task(title="healthy successor")
+    _desktop_origin(tid)
+    _blanket_mirror(tid)
+    conn = kbc.connect()
+    try:
+        with kb.write_txn(conn):
+            old_run = conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'gave_up', ?)",
+                (tid, int(time.time()) - 30),
+            ).lastrowid
+            kb._append_event(
+                conn, tid, "gave_up", {"failures": 2, "error": "old failure"}, run_id=None,
+            )
+            new_run = conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', ?)",
+                (tid, int(time.time()) + 1),
+            ).lastrowid
+            conn.execute(
+                "UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?",
+                (new_run, tid),
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert adapter.sent == []
+    assert _topic_rows(tid, "alerts") == []
+
+
+@pytest.mark.parametrize("legacy_null", [False, True])
+def test_superseded_failure_is_silent_at_same_second_after_successor_completed(
+    board, monkeypatch, legacy_null,
+):
+    """Run identity wins; ambiguous legacy timestamps fail closed."""
+    tid = _task(title="completed successor")
+    _desktop_origin(tid)
+    _blanket_mirror(tid)
+    conn = kbc.connect()
+    try:
+        with kb.write_txn(conn):
+            stamp = int(time.time())
+            old_run = conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'gave_up', ?)",
+                (tid, stamp - 30),
+            ).lastrowid
+            kb._append_event(
+                conn,
+                tid,
+                "gave_up",
+                {"failures": 2, "error": "old failure"},
+                run_id=None if legacy_null else old_run,
+            )
+            event_stamp = conn.execute(
+                "SELECT MAX(created_at) FROM task_events WHERE task_id=? AND kind='gave_up'",
+                (tid,),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
+                "VALUES (?, 'completed', ?, ?, 'completed')",
+                (tid, event_stamp, event_stamp),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (tid,),
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    _tick(monkeypatch, _make_runner(adapter), n=2)
+
+    assert adapter.sent == []
+    assert _topic_rows(tid, "alerts") == []
 
 
 def test_desktop_origin_needs_input_routes_once_to_approvals_never_fred(board, monkeypatch):

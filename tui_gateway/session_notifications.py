@@ -402,7 +402,8 @@ def _kb_poll_board(_kb, slug: str, session_key: str, origin_first: bool = False)
                 from gateway import kanban_notify_routing as _routing
                 siblings = [s for s in subs if s.get("task_id") == sub["task_id"]]
                 events = ([] if _routing.sub_role(sub, siblings) == _routing.ROLE_MIRROR
-                          else [ev for ev in events if _routing.is_actionable(ev)])
+                          else [ev for ev in events if _routing.is_actionable(ev)
+                                and _routing.event_is_current_attempt(conn, sub["task_id"], ev)])
             if not events:
                 continue
             task = _kb.get_task(conn, sub["task_id"])

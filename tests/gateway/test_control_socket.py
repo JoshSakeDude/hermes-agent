@@ -12,6 +12,7 @@ from gateway.control_socket import (
     CONTROL_PROTOCOL_VERSION,
     GatewayControlServer,
     identify_gateway,
+    identify_gateway_with_peer_pid,
     query_gateway_control,
     resolve_client_socket_path,
     resolve_server_socket_path,
@@ -123,6 +124,31 @@ def test_server_answers_identify_and_status(home: Path):
     ident, status = _run(scenario())
     assert ident == {"pid": 4242, "code_sha": "abc123", "protocol": 1}
     assert status == {"gateway_state": "running"}
+
+
+def test_identify_peer_pid_comes_from_kernel_socket_credentials(home: Path):
+    import os
+
+    async def scenario():
+        server = GatewayControlServer(
+            home, verb_handlers={"identify": lambda: {"pid": 999999, "kind": "forged"}},
+        )
+        assert await server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, lambda: identify_gateway_with_peer_pid(home))
+        finally:
+            await server.stop()
+
+    answer = _run(scenario())
+    if not hasattr(socket, "SO_PEERCRED"):
+        assert answer is None
+        return
+    assert answer is not None
+    identity, peer_pid = answer
+    assert identity["pid"] == 999999
+    assert peer_pid == os.getpid()
+    assert peer_pid != identity["pid"]
 
 
 def test_unknown_verb_and_malformed_request(home: Path):

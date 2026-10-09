@@ -284,6 +284,9 @@ class _Collector:
         self.started_at = int(getattr(runner, "_kanban_notify_started_at", time.time()))
         self._subs_by_task: dict[str, list[dict]] = {}
 
+    def _event_is_current_attempt(self, conn: Any, task_id: str, ev: Any) -> bool:
+        return _routing.event_is_current_attempt(conn, task_id, ev)
+
     def collect(self) -> list[dict]:
         if not self.active_platforms:
             logger.debug("kanban notifier: no connected adapters; skipping tick")
@@ -357,6 +360,11 @@ class _Collector:
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
         )
+        task = self.kb.get_task(conn, sub["task_id"])
+        events = [
+            ev for ev in events
+            if self._event_is_current_attempt(conn, sub["task_id"], ev)
+        ]
         if role is not None:
             # Origin-first: mirrors consume silently; everyone else only sees actionable events.
             # The cursor has already advanced over the dropped events, so they never replay.
@@ -368,7 +376,6 @@ class _Collector:
                     events = [ev for ev in events if _routing.event_topic_role(ev) == role]
         if not events:
             return None
-        task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task,
@@ -400,7 +407,9 @@ class _Collector:
             if consumed is not None and ev.id > consumed and ev.created_at > cutoff:
                 break
             new_cursor = ev.id
-            if (consumed is None or ev.id > consumed) and _routing.is_actionable(ev):
+            if ((consumed is None or ev.id > consumed)
+                    and self._event_is_current_attempt(conn, sub["task_id"], ev)
+                    and _routing.is_actionable(ev)):
                 due.append(ev)
         if new_cursor == old_cursor or not kbn.claim_notify_cursor_range(
                 conn, old_cursor=old_cursor, new_cursor=new_cursor, **key):
@@ -460,6 +469,8 @@ class _Collector:
                 # activation may route only events created during this notifier run.
                 if ev.created_at < self.started_at:
                     continue
+                if not self._event_is_current_attempt(conn, task_id, ev):
+                    continue
                 if not _routing.is_actionable(ev):
                     continue
                 role = _routing.event_topic_role(ev) if origins else _routing.ROLE_OPS
@@ -488,7 +499,7 @@ class _Collector:
         headless: dict[str, list[Any]] = {}
         for row in rows:
             ev = self.kb.Event.from_row(row)
-            if _routing.is_actionable(ev):
+            if self._event_is_current_attempt(conn, ev.task_id, ev) and _routing.is_actionable(ev):
                 headless.setdefault(ev.task_id, []).append(ev)
         target = self._ops_topic_target(_routing.ROLE_OPS) if headless else None
         if target is not None:
@@ -514,6 +525,8 @@ class _Collector:
                 conn, platform="tui", kinds=_routing.ACTIONABLE_KINDS, min_created_at=lo, max_created_at=hi):
             tid = desk["task_id"]
             if tid in seen or not _routing.is_actionable(ev):
+                continue
+            if not self._event_is_current_attempt(conn, tid, ev):
                 continue
             task = self.kb.get_task(conn, tid)
             if task is None or task.status == "archived":
@@ -772,6 +785,15 @@ class _KanbanNotification:
     async def unsub(self) -> None:
         await _to_thread_process_service(self.runner._kanban_unsub, self.sub, self.board_slug)
 
+    def _event_is_still_current(self, ev: Any) -> bool:
+        """Final run-identity fence immediately before external delivery."""
+        with _pin_first():
+            conn = _kbc().connect(board=self.board_slug)
+            try:
+                return _routing.event_is_current_attempt(conn, self.task_id, ev)
+            finally:
+                conn.close()
+
     def clear_failures(self) -> None:
         self.sub_fail_counts.pop(self.sub_key, None)
 
@@ -924,10 +946,17 @@ class _KanbanNotification:
         source = SessionSource(platform=self.plat, chat_id=self.sub["chat_id"], profile=served_profile)
         return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
 
-    async def wake(self) -> None:
+    async def wake(self, events: list[Any]) -> None:
         """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
         from gateway.wake import deliver_wake
         sub = self.sub
+
+        async def still_current_at_admission() -> bool:
+            return all([
+                await _to_thread_process_service(self._event_is_still_current, ev)
+                for ev in events
+            ])
+
         if not self.is_push_adapter:
             # A served profile's raw-session wake runs in THAT profile's scope, in-process: the
             # shared listener's /p/<profile>/ self-post would need the profile's own
@@ -936,7 +965,8 @@ class _KanbanNotification:
             async with self._owner_scope():
                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
                                    profile=self._served_wake_profile(),
-                                   notification_category="diagnostic" if self.wake_diagnostic else "result")
+                                   notification_category="diagnostic" if self.wake_diagnostic else "result",
+                                   admission_check=still_current_at_admission)
             self._log_woke()
             return
         from gateway.session import SessionSource
@@ -965,7 +995,8 @@ class _KanbanNotification:
                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
-                               notification_category="diagnostic" if self.wake_diagnostic else "result")
+                               notification_category="diagnostic" if self.wake_diagnostic else "result",
+                               admission_check=still_current_at_admission)
         self._log_woke()
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
@@ -1011,7 +1042,15 @@ class _KanbanNotification:
 
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        current_events = []
         for ev in self.d["events"]:
+            if not await _to_thread_process_service(self._event_is_still_current, ev):
+                logger.info(
+                    "kanban notifier: suppressed superseded %s event %s for %s before delivery",
+                    ev.kind, ev.id, self.task_id,
+                )
+                continue
+            current_events.append(ev)
             msg = self.format_event(ev)
             if msg is None:
                 continue
@@ -1044,6 +1083,7 @@ class _KanbanNotification:
                     "kanban notifier: dropping subscription %s on %s after %d consecutive send failures", exc, False,
                 )
                 return False
+        self.d = {**self.d, "events": current_events}
         return True
 
     async def deliver(self) -> None:
@@ -1071,50 +1111,60 @@ class _KanbanNotification:
 
         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
-        async with self._owner_scope():
-            if not await self._send_pings():
-                return
-            # All text pings delivered (or skipped for non-push / wake-only).
-            original_events = self.d["events"]
-            from gateway.warning_notifications import warning_notifications_enabled
-            split = not warning_notifications_enabled(self.platform_str)
-            wake_groups = ([original_events] if not split else [
-                [ev for ev in original_events if diagnostic_event(ev)],
-                [ev for ev in original_events if not diagnostic_event(ev)],
-            ])
-            wake_payloads = []
-            for events in wake_groups:
-                if not events:
-                    continue
-                self.d = {**self.d, "events": events}
-                self.wake_handoff = self.wake_review_detail = ""
-                for ev in events:
-                    self.format_event(ev)
-                self.build_wake_text()
-                if self.wake_kinds:
-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
-            self.d = {**self.d, "events": original_events}
-        wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
-        from gateway.wake import WakeNotAccepted
-
-        # A requested wake is required even when its passive ping already landed.
-        if wake_payloads:
-            try:
-                for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
-                    await self.wake()
+        from gateway.wake import WakeNotAccepted, WakeSuperseded
+        is_push = self.is_push_adapter
+        original_events = self.d["events"]
+        try:
+            async with self._owner_scope():
+                if not await self._send_pings():
+                    return
+                # All text pings delivered (or skipped for non-push / wake-only).
+                original_events = self.d["events"]
+                from gateway.warning_notifications import warning_notifications_enabled
+                split = not warning_notifications_enabled(self.platform_str)
+                wake_groups = ([original_events] if not split else [
+                    [ev for ev in original_events if diagnostic_event(ev)],
+                    [ev for ev in original_events if not diagnostic_event(ev)],
+                ])
+                for events in wake_groups:
+                    # A successor can start after collection or even after the
+                    # passive ping. Re-read immediately before every wake.
+                    events = [
+                        ev for ev in events
+                        if await _to_thread_process_service(self._event_is_still_current, ev)
+                    ]
+                    if not events:
+                        continue
+                    self.d = {**self.d, "events": events}
+                    self.wake_handoff = self.wake_review_detail = ""
+                    for ev in events:
+                        self.format_event(ev)
+                    self.build_wake_text()
+                    if not self.wake_kinds:
+                        continue
+                    try:
+                        await self.wake(events)
+                    except WakeSuperseded:
+                        logger.info(
+                            "kanban notifier: suppressed superseded wake for %s at transport admission",
+                            self.task_id,
+                        )
+                        continue
                 self.clear_failures()
-            except WakeNotAccepted:
-                # Startup / full queue is not a dead destination. Keep the durable
-                # subscription alive regardless of how long admission takes.
-                await self.rewind()
-                return
-            except Exception as _wk_err:
-                await self._wake_failed(
-                    "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
-                    else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
-                    _wk_err,
-                )
-                return
+        except WakeNotAccepted:
+            # Startup / full queue is not a dead destination. Keep the durable
+            # subscription alive regardless of how long admission takes.
+            await self.rewind()
+            return
+        except Exception as _wk_err:
+            await self._wake_failed(
+                "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
+                else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
+                _wk_err,
+            )
+            return
+        finally:
+            self.d = {**self.d, "events": original_events}
 
         # Delivery complete: persist fallback dedup before the subscription can
         # be removed, then advance the cursor.

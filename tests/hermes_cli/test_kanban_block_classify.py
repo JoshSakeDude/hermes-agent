@@ -55,7 +55,10 @@ def test_typed_block_classifies_untyped_breaker_block(kanban_home, monkeypatch):
         assert after.current_run_id is None
         kinds = [e.kind for e in kb.list_events(conn, tid)]
         assert (kinds.count("blocked"), kinds.count("gave_up"), kinds.count("timed_out")) == (1, 1, 2)
-        assert len(kb.list_runs(conn, tid)) == 2
+        runs = kb.list_runs(conn, tid)
+        assert len(runs) == 2
+        gave_up = next(e for e in kb.list_events(conn, tid) if e.kind == "gave_up")
+        assert gave_up.run_id == runs[-1].id
 
 
 def test_typed_block_still_refuses_typed_or_live_blocked_cards(kanban_home, monkeypatch):

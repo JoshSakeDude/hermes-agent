@@ -701,6 +701,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        run_id: Optional[int] = None
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -735,6 +736,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
+                event_run_id=run_id,
+                expected_latest_run_id=run_id,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
             )
     return timed_out
@@ -1135,9 +1138,9 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
-    # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
+    # ``(task_id, pid, claimer, dead_worker, ended_run_id)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
-    crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
+    crash_details: list[tuple[str, int, str, _DeadWorker, Optional[int]]] = field(default_factory=list)
     # Worker-exit observer payloads, fired only after every reclaim/accounting
     # txn has committed.
     exited_hook_payloads: list[dict] = field(default_factory=list)
@@ -1209,7 +1212,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead, run_id))
     return sweep
 
 
@@ -1224,10 +1227,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
-    for _, _, _, dead in crash_details:
+    for _, _, _, dead, _ in crash_details:
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
-    for tid, pid, claimer, dead in crash_details:
+    for tid, pid, claimer, dead, ended_run_id in crash_details:
         error_text = dead.error_text
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
@@ -1252,6 +1255,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 force_trip=True,
                 release_claim=False,
                 end_run=False,
+                event_run_id=ended_run_id,
+                expected_latest_run_id=ended_run_id,
                 event_payload_extra={
                     "pid": pid,
                     "claimer": claimer,
@@ -1271,6 +1276,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 force_trip=True,
                 release_claim=False,
                 end_run=False,
+                event_run_id=ended_run_id,
+                expected_latest_run_id=ended_run_id,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
@@ -1286,6 +1293,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 failure_limit=1 if is_systemic else None,
                 release_claim=False,
                 end_run=False,
+                event_run_id=ended_run_id,
+                expected_latest_run_id=ended_run_id,
                 event_payload_extra=extra,
             )
         if tripped:
@@ -1354,6 +1363,8 @@ def _record_task_failure(
     expected_run_id: Optional[int] = None,
     release_claim: bool = False,
     end_run: bool = False,
+    event_run_id: Optional[int] = None,
+    expected_latest_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
     on_trip: Optional[Callable[[], None]] = None,
@@ -1390,6 +1401,13 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        if expected_latest_run_id is not None:
+            latest = conn.execute(
+                "SELECT MAX(id) AS run_id FROM task_runs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if latest is None or latest["run_id"] != int(expected_latest_run_id):
+                return False
         if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
             return False
         if expected_run_id is not None and end_run:
@@ -1463,7 +1481,7 @@ def _record_task_failure(
         if force_trip:
             terminal_extra["retryable"] = False
         payload.update(terminal_extra)
-        run_id = None
+        run_id = event_run_id
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
@@ -1496,14 +1514,29 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    started_at: Optional[str] = None,
+) -> bool:
     """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
     emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
     decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
     persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
-    whose bare-PID kill authority a new spawn must not inherit."""
-    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    whose bare-PID kill authority a new spawn must not inherit. False means a
+    successor run replaced the claim before PID attachment."""
+    started_at = started_at or _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+            return False
         conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                      (int(pid), started_at, task_id))
         run_id = _kb._current_run_id(conn, task_id)
@@ -1511,6 +1544,17 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, run_id))
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+    return True
+
+
+def _run_is_current(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> bool:
+    """Whether a launch callback still belongs to this task's active run."""
+    if run_id is None:
+        return False
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return bool(row and row["status"] == "running" and row["current_run_id"] == int(run_id))
 
 
 def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
@@ -2140,6 +2184,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_run_id=claimed.current_run_id,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2154,7 +2199,19 @@ def _dispatch_lane_task(
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+            spawned_fingerprint = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+            if not _set_worker_pid(
+                conn, claimed.id, int(pid), expected_run_id=claimed.current_run_id,
+                started_at=spawned_fingerprint,
+            ):
+                _terminate_reclaimed_worker(
+                    int(pid), claimed.claim_lock, started_at=spawned_fingerprint,
+                )
+                return False
+        elif not _run_is_current(conn, claimed.id, claimed.current_run_id):
+            # Optional-PID launchers still need run identity fencing before
+            # hooks/result accounting can report the stale callback as success.
+            return False
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2174,6 +2231,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_run_id=claimed.current_run_id,
             infrastructure=infrastructure,
         ):
             result.auto_blocked.append(claimed.id)
@@ -2607,18 +2665,18 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
-    lets an attacker-planted ``hermes`` shadow the running install (#111569).
+    same-directory file), then the running source installation's durable
+    bootstrap command.  A managed store interpreter is not itself a runnable
+    Hermes installation: launching it as ``python -m hermes_cli.main`` from a
+    task worktree bypasses the committed dependency generation and fails before
+    the worker starts.  ``installation_command`` preserves the owning checkout
+    and falls back to an isolated runtime command for unmanaged installs.
+
+    The installation command must win over PATH: a PATH-first lookup lets an
+    attacker-planted ``hermes`` shadow the running install (#111569).
     Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
     sits below ``gateway`` in the dependency order.
     """
-    import importlib.util
-    import shutil
-
     env_bin = os.environ.get("HERMES_BIN", "").strip()
     if env_bin:
         if _looks_like_path(env_bin):
@@ -2628,16 +2686,9 @@ def _resolve_hermes_argv() -> list[str]:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
 
-    try:
-        if importlib.util.find_spec("hermes_cli") is not None:
-            return _module_hermes_argv()
-    except Exception:
-        pass
+    from hermes_cli._launchers import installation_command
 
-    hermes_bin = _safe_which_no_cwd("hermes") if _kb._IS_WINDOWS else shutil.which("hermes")
-    if hermes_bin:
-        return _hermes_path_argv(hermes_bin)
-    return _module_hermes_argv()
+    return installation_command(Path(__file__).resolve().parents[1])
 
 
 def _worker_terminal_timeout_env(

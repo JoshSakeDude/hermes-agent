@@ -125,6 +125,38 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     assert calls["n"] == 2
 
 
+def test_deliver_wake_rechecks_admission_after_429(monkeypatch):
+    """A wake superseded during backoff must not make a second HTTP attempt."""
+    from aiohttp import web
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", (0.01,))
+    calls = {"http": 0, "checks": 0}
+
+    async def handler(request):
+        calls["http"] += 1
+        return web.json_response({"error": "busy"}, status=429)
+
+    async def admission_check():
+        calls["checks"] += 1
+        return calls["checks"] == 1
+
+    async def run():
+        runner, port = await _serve(handler)
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            with pytest.raises(wake_mod.WakeSuperseded):
+                await deliver_wake(
+                    adapter, text="x", session_id="sid", admission_check=admission_check,
+                )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert calls == {"http": 1, "checks": 2}
+
+
 def test_persist_delegation_delivery_appends_delivery_row(tmp_path):
     """#85957: the delegation completion lands in the session transcript as a
     display_kind=async_delegation_complete delivery row (real SessionDB), and

@@ -11,6 +11,7 @@ These tests cover the delivery half that now lives in tui_gateway/server.py:
 unsubscribe) and ``_format_kanban_event_text``.
 """
 
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -139,6 +140,35 @@ class TestCollectKanbanNotifications:
         rows = _sub_rows(tid)
         assert len(rows) == 1
         assert rows[0]["last_event_id"] > pre_cursor
+
+    def test_origin_first_suppresses_superseded_run_failure(self):
+        tid = _create_subscribed_task()
+        conn = kbc.connect()
+        try:
+            with kb.write_txn(conn):
+                old_run = conn.execute(
+                    "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'gave_up', ?)",
+                    (tid, int(time.time()) - 30),
+                ).lastrowid
+                kb._append_event(
+                    conn, tid, "gave_up", {"failures": 2, "error": "old"}, run_id=old_run,
+                )
+                successor = conn.execute(
+                    "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', ?)",
+                    (tid, int(time.time())),
+                ).lastrowid
+                conn.execute(
+                    "UPDATE tasks SET status='running', current_run_id=? WHERE id=?",
+                    (successor, tid),
+                )
+        finally:
+            conn.close()
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"kanban": {"notification_routing": "origin_first"}},
+        ):
+            assert _collect_kanban_notifications(_session()) == []
 
     def test_non_tui_subscription_does_not_open_board_writable(self):
         tid = _create_subscribed_task(platform="telegram", chat_id="chat-1")

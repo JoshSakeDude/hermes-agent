@@ -44,7 +44,7 @@ __all__ = [
     "ROUTE_ROLE_KEY", "ROLE_ORIGIN", "ROLE_MIRROR", "ROLE_FALLBACK", "ROLE_PASSIVE",
     "ROLE_ALERTS", "ROLE_APPROVALS", "ROLE_OPS", "ORIGIN_FIRST", "LEGACY",
     "ACTIONABLE_KINDS", "DEFAULT_ORIGIN_STALE_SECONDS", "routing_mode", "origin_stale_seconds",
-    "is_actionable", "event_topic_role", "sub_role", "describe_origin", "strip_route_metadata",
+    "is_actionable", "event_is_current_attempt", "event_topic_role", "sub_role", "describe_origin", "strip_route_metadata",
     "fallback_prefix", "topic_prefix",
 ]
 
@@ -90,6 +90,28 @@ def is_actionable(ev: Any) -> bool:
     if kind == "blocked" and payload.get("kind") == "dependency":
         return False  # waits in todo and resumes on its own when the parent finishes
     return kind in ACTIONABLE_KINDS
+
+
+def event_is_current_attempt(conn: Any, task_id: str, ev: Any) -> bool:
+    """Return false when a run-scoped event has been superseded.
+
+    ``gave_up`` rows written by older releases may lack ``run_id``. Treat an
+    ambiguous equal/newer timestamp as stale rather than risking a false alert.
+    Other null-run events are task-scoped and remain eligible.
+    """
+    row = conn.execute(
+        "SELECT id, started_at FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return True
+    latest_id = int(row["id"])
+    if ev.run_id is not None:
+        return int(ev.run_id) == latest_id
+    if ev.kind != "gave_up":
+        return True
+    latest_started_at = row["started_at"]
+    return latest_started_at is None or int(latest_started_at) < int(ev.created_at)
 
 
 def event_topic_role(ev: Any) -> Optional[str]:

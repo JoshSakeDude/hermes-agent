@@ -12,6 +12,7 @@ on transient errors) so callers can rewind cursors / retry instead of silently l
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Optional
 
@@ -37,6 +38,20 @@ def adapter_supports_push(adapter: Any) -> bool:
 
 class WakeNotAccepted(RuntimeError):
     """No adapter admission: retry without treating a healthy chat as dead."""
+
+
+class WakeSuperseded(RuntimeError):
+    """The durable event ceased to be current before transport admission."""
+
+
+async def _require_admission_check(check: Any) -> None:
+    if check is None:
+        return
+    allowed = check()
+    if inspect.isawaitable(allowed):
+        allowed = await allowed
+    if not allowed:
+        raise WakeSuperseded("wake event was superseded before transport admission")
 
 
 def session_owned_by_profile(config: Any, profile: Optional[str], session_id: Any) -> bool:
@@ -76,20 +91,22 @@ def session_owned_by_profile(config: Any, profile: Optional[str], session_id: An
     return bool(row) and (row.get("profile_name") or profile) == profile
 
 
-async def admit_internal_event(adapter: Any, event: Any) -> None:
+async def admit_internal_event(adapter: Any, event: Any, *, admission_check: Any = None) -> None:
     """Require a concrete adapter admission, not merely a handler returning None.
 
     The public handler return stays unchanged. This receipt means scheduled/queued,
     not model execution, authorization of a later turn, or successful outbound delivery.
     """
     event._gateway_accepted = False
+    await _require_admission_check(admission_check)
     await adapter.handle_message(event)
     if event._gateway_accepted is not True:
         raise WakeNotAccepted("internal wake not accepted by adapter")
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-                       notification_category: str = "result", profile: Optional[str] = None) -> None:
+                       notification_category: str = "result", profile: Optional[str] = None,
+                       admission_check: Any = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
@@ -102,7 +119,7 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         from gateway.platforms.event import MessageEvent, MessageType
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
                                    metadata={"notification_category": notification_category})
-        await admit_internal_event(adapter, synth_event)
+        await admit_internal_event(adapter, synth_event, admission_check=admission_check)
         return
     if not session_id:
         raise ValueError("deliver_wake: non-push adapter (supports_async_delivery=False) "
@@ -112,7 +129,9 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         extra["profile"] = profile
     if notification_category == "diagnostic":
         extra["notification_category"] = notification_category
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
+    await _self_post_chat_completion(
+        adapter, text=text, session_id=session_id, admission_check=admission_check, **extra,
+    )
 
 
 def _delegation_display_metadata(evt: dict) -> dict:
@@ -184,7 +203,8 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
 
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
                                       notification_category: str = "result",
-                                      profile: Optional[str] = None) -> None:
+                                      profile: Optional[str] = None,
+                                      admission_check: Any = None) -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
@@ -203,6 +223,7 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
             raise RuntimeError(
                 f"wake self-post for served profile {profile!r} requires in-process session "
                 "delivery; refusing to self-post as the default profile")
+        await _require_admission_check(admission_check)
         await in_process(session_id=session_id, text=text, profile=str(profile),
                          notification_category=notification_category)
         return
@@ -230,6 +251,9 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
         if attempt:
             await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])
         try:
+            # A successor can start during 429/network backoff. Revalidate
+            # immediately before every transport attempt, not only attempt one.
+            await _require_admission_check(admission_check)
             timeout = aiohttp.ClientTimeout(total=WAKE_TURN_TIMEOUT_SECONDS)
             async with aiohttp.ClientSession(timeout=timeout) as http:
                 async with http.post(url, json=payload, headers=headers) as resp:

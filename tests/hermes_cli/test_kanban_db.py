@@ -271,6 +271,9 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home):
         assert row["status"] == "blocked"
         kinds = [e.kind for e in kb.list_events(conn, t)]
         assert kinds[-2:] == ["reclaimed", "gave_up"]
+        gave_up = [e for e in kb.list_events(conn, t) if e.kind == "gave_up"][-1]
+        reclaimed = [e for e in kb.list_events(conn, t) if e.kind == "reclaimed"][-1]
+        assert gave_up.run_id == reclaimed.run_id
 
 
 def test_stale_claim_extend_live_worker_does_not_count_failure(
@@ -418,14 +421,94 @@ def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_h
         assert task.consecutive_failures == 1  # one spawn, not failure_limit / max_retries of them
         assert "terminal provider error" in (task.last_failure_error or "")
         gave_up = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
+            "SELECT payload, run_id FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
         ).fetchone()
         assert json.loads(gave_up["payload"])["terminal_provider"] is True
+        assert gave_up["run_id"] is not None
 
         # Sticky: the breaker did not reach its counter limit, yet the card must stay parked
         # until an operator fixes the provider and unblocks it.
         kb.recompute_ready(conn)
         assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_old_crash_accounting_cannot_mutate_a_successor_run(kanban_home):
+    """The reclaim/accounting transaction gap is fenced by latest run id."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="race", assignee="a")
+        first = kb.claim_task(conn, tid)
+        assert first is not None
+        old_run = first.current_run_id
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed", status="crashed", error="old")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                (tid,),
+            )
+        successor = kb.claim_task(conn, tid)
+        assert successor is not None
+
+        tripped = kbd._record_task_failure(
+            conn,
+            tid,
+            error="old crash",
+            outcome="crashed",
+            force_trip=True,
+            release_claim=False,
+            end_run=False,
+            event_run_id=old_run,
+            expected_latest_run_id=old_run,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert tripped is False
+        assert task.status == "running"
+        assert task.current_run_id == successor.current_run_id
+        assert task.consecutive_failures == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='gave_up'",
+            (tid,),
+        ).fetchone()[0] == 0
+
+
+def test_stale_spawn_pid_cannot_attach_to_successor_run(kanban_home, monkeypatch):
+    """A launcher callback for run N must not attach its PID to run N+1."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: "spawn-fingerprint")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="spawn race", assignee="a")
+        first = kb.claim_task(conn, tid)
+        assert first is not None
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed", status="crashed", error="old")
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                (tid,),
+            )
+        successor = kb.claim_task(conn, tid)
+        assert successor is not None
+
+        attached = kbd._set_worker_pid(
+            conn, tid, 4242, expected_run_id=first.current_run_id,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert attached is False
+        assert task is not None
+        assert task.current_run_id == successor.current_run_id
+        assert task.worker_pid is None
+        run = conn.execute(
+            "SELECT worker_pid FROM task_runs WHERE id=?", (successor.current_run_id,),
+        ).fetchone()
+        assert run["worker_pid"] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned'",
+            (tid,),
+        ).fetchone()[0] == 0
 
 
 
@@ -1575,21 +1658,45 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
+def test_resolve_hermes_argv_prefers_installation_command_over_path_shim(monkeypatch):
     """A `hermes` on PATH must not shadow the running install (#111569):
-    the module argv wins whenever ``hermes_cli`` is importable; only an
-    explicit ``$HERMES_BIN`` overrides it."""
+    the owning installation command wins; only an explicit ``$HERMES_BIN``
+    overrides it."""
     import shutil
-    import sys
     from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import _launchers
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    monkeypatch.setattr(_launchers, "installation_command", lambda root: ["/owning/install/hermes"])
+    assert kbd._resolve_hermes_argv() == ["/owning/install/hermes"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+
+
+def test_resolve_hermes_argv_uses_installation_bootstrap_command(monkeypatch):
+    """A managed-Python dispatcher must preserve the install bootstrap.
+
+    A bare ``store-python -m hermes_cli.main`` process starts from a task
+    worktree without selecting the committed dependency generation, so every
+    Kanban worker exits with ``no dependency environment is committed``.
+    """
+    import shutil
+
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import _launchers
+
+    expected = ["/opt/hermes/.hermes/bin/hermes"]
+    roots = []
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
+    monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
+    monkeypatch.setattr(_launchers, "installation_command", lambda root: roots.append(root) or expected)
+
+    assert kbd._resolve_hermes_argv() == expected
+    assert roots == [Path(kbd.__file__).resolve().parents[1]]
 
 
 
