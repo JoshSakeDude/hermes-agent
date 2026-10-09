@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,12 +29,12 @@ def test_review_binding_requires_literal_full_sha():
     assert verifier.literal_commit_sha(None) is None
 
 
-def _fake_proc(tmp_path: Path, pid: int, repo: Path, cmdline: bytes = b"hermes\0gateway\0run\0") -> Path:
+def _fake_proc(tmp_path: Path, pid: int, cwd: Path, cmdline: bytes = b"hermes\0gateway\0run\0") -> Path:
     proc_root = tmp_path / "proc"
     proc = proc_root / str(pid)
     proc.mkdir(parents=True)
     (proc / "cmdline").write_bytes(cmdline)
-    (proc / "cwd").symlink_to(repo, target_is_directory=True)
+    (proc / "cwd").symlink_to(cwd, target_is_directory=True)
     return proc_root
 
 
@@ -59,6 +60,66 @@ def test_running_gateway_attestation_reads_live_control_socket(tmp_path):
     )
     assert result["matches"] is True
     assert result["returncode"] == 0
+
+
+def test_running_gateway_attestation_accepts_canonical_service_home_cwd(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sha = "d" * 40
+    pid = 4343
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    proc_root = _fake_proc(tmp_path, pid, home)
+    identity = {
+        "pid": pid,
+        "kind": "hermes-gateway",
+        "boot_code_sha": sha,
+        "boot_repo": str(repo),
+        "hermes_home": str(home),
+    }
+
+    result = verifier.check_running_gateway(
+        home, sha, repo, proc_root=proc_root,
+        query_fn=lambda queried_home: (identity, pid),
+    )
+    assert result["matches"] is True
+    assert result["returncode"] == 0
+
+
+def test_gateway_query_import_prefers_reviewed_repo_over_stale_editable(tmp_path):
+    stale = tmp_path / "stale-editable"
+    package = stale / "gateway"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "control_socket.py").write_text(
+        "def identify_gateway_with_peer_pid(home):\n    return 'stale'\n",
+        encoding="utf-8",
+    )
+    code = f"""
+import importlib.util
+import inspect
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("verifier", {str(SCRIPT)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+query = module.load_gateway_peer_query(Path(sys.argv[1]))
+print(Path(inspect.getsourcefile(query)).resolve())
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(stale)
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(SCRIPT.parents[1])],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert Path(completed.stdout.strip()) == SCRIPT.parents[1] / "gateway" / "control_socket.py"
 
 
 def test_running_gateway_attestation_rejects_non_gateway_process(tmp_path):
@@ -98,6 +159,52 @@ def test_running_gateway_attestation_rejects_wrong_sha_independently(tmp_path):
         "boot_code_sha": "e" * 40,
         "boot_repo": str(repo),
         "hermes_home": str(home),
+    }
+    result = verifier.check_running_gateway(
+        home, "f" * 40, repo, proc_root=proc_root,
+        query_fn=lambda queried_home: (identity, pid),
+    )
+    assert result["matches"] is False
+
+
+def test_running_gateway_attestation_rejects_wrong_repo_independently(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    wrong_repo = tmp_path / "wrong-repo"
+    wrong_repo.mkdir()
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    pid = 6363
+    proc_root = _fake_proc(tmp_path, pid, home)
+    identity = {
+        "pid": pid,
+        "kind": "hermes-gateway",
+        "boot_code_sha": "f" * 40,
+        "boot_repo": str(wrong_repo),
+        "hermes_home": str(home),
+    }
+    result = verifier.check_running_gateway(
+        home, "f" * 40, repo, proc_root=proc_root,
+        query_fn=lambda queried_home: (identity, pid),
+    )
+    assert result["matches"] is False
+
+
+def test_running_gateway_attestation_rejects_wrong_home_independently(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    wrong_home = tmp_path / "wrong-home"
+    wrong_home.mkdir()
+    pid = 6464
+    proc_root = _fake_proc(tmp_path, pid, home)
+    identity = {
+        "pid": pid,
+        "kind": "hermes-gateway",
+        "boot_code_sha": "f" * 40,
+        "boot_repo": str(repo),
+        "hermes_home": str(wrong_home),
     }
     result = verifier.check_running_gateway(
         home, "f" * 40, repo, proc_root=proc_root,

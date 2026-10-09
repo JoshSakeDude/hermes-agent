@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -85,13 +86,33 @@ def live_command_env(home: Path) -> dict[str, str]:
     return env
 
 
+def load_gateway_peer_query(repo: Path):
+    """Import the control-socket client from the checkout under review."""
+    repo = repo.resolve()
+    sys.path.insert(0, str(repo))
+    try:
+        importlib.invalidate_caches()
+        module = importlib.import_module("gateway.control_socket")
+    finally:
+        sys.path.pop(0)
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        raise RuntimeError("gateway control-socket client has no source file")
+    source = Path(module_file).resolve()
+    expected_source = repo / "gateway" / "control_socket.py"
+    if source != expected_source:
+        raise RuntimeError(
+            f"gateway control-socket client imported from {source}, expected {expected_source}"
+        )
+    return module.identify_gateway_with_peer_pid
+
+
 def check_running_gateway(home: Path, expected_sha: str, repo: Path, *, query_fn=None,
                           proc_root: Path = Path("/proc")) -> dict:
     """Read boot identity from the live gateway-owned local control socket."""
     try:
         if query_fn is None:
-            from gateway.control_socket import identify_gateway_with_peer_pid
-            query_fn = identify_gateway_with_peer_pid
+            query_fn = load_gateway_peer_query(repo)
         answer = query_fn(home)
         if not (isinstance(answer, tuple) and len(answer) == 2 and isinstance(answer[0], dict)):
             raise RuntimeError("live gateway control socket did not answer identify")
@@ -106,7 +127,7 @@ def check_running_gateway(home: Path, expected_sha: str, repo: Path, *, query_fn
             and identity.get("boot_code_sha") == expected_sha
             and Path(identity.get("boot_repo", "")).resolve() == repo
             and Path(identity.get("hermes_home", "")).resolve() == home
-            and cwd == repo
+            and cwd in (repo, home)
             and "gateway" in cmdline
         )
         return {

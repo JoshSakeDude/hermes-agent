@@ -80,7 +80,7 @@ This additionally verifies:
 - fixed policy values `notification_routing=origin_first` and `origin_stale_seconds=600`—they are not caller-overridable;
 - distinct Tasks, Approvals, Ops, and Alerts topic IDs;
 - every role-stamped Telegram subscription points to the configured Gohan Ops chat and exact role thread;
-- the gateway process answering the canonical local control socket booted the exact reviewed SHA from the promoted checkout; Linux `SO_PEERCRED` must bind the socket peer PID to the identify response, and its PID cwd, command line, gateway kind, repository, and canonical home must agree;
+- the gateway process answering the canonical local control socket booted the exact reviewed SHA from the promoted checkout; Linux `SO_PEERCRED` must bind the socket peer PID to the identify response, its command line/gateway kind/repository/canonical home must agree, and its PID cwd must be either that checkout or the canonical Hermes home used as the stable service `WorkingDirectory`;
 - the checkout remains clean and still resolves to the reviewed SHA.
 
 Live DB, topic-map, and control-socket paths are fixed to the account home returned by the OS user database; caller-provided `HOME` and `HERMES_HOME` are intentionally ignored so fixtures cannot substitute for live evidence.
