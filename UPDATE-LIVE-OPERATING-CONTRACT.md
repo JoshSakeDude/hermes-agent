@@ -11,18 +11,17 @@ The introducing launcher change was `da18c20226e6de243e9f279686d272224413619b` (
 During implementation only:
 
 ```bash
-HERMES_PYTHON=/path/to/python scripts/verify-live-operating-contract.py --allow-dirty
+scripts/verify-live-operating-contract.py --allow-dirty
 ```
 
-A dirty result is explicitly `promotable: false`. It may guide development but cannot authorize deployment.
+A dirty result is explicitly `promotable: false`. It may guide development but cannot authorize deployment. By default, leave `HERMES_PYTHON` unset so `scripts/run_tests.sh` selects the installation-managed test environment. Set it only to the interpreter of a complete dev/test environment built with `python -m pm.build_env --source . --out <path> --group dev --group test`; an arbitrary checkout venv may lack contract dependencies and correctly fails the gate.
 
 ## Promotion gate
 
 Commit the reviewed candidate, then run:
 
 ```bash
-HERMES_PYTHON=/path/to/python \
-  scripts/verify-live-operating-contract.py --expected-sha <reviewed-full-sha>
+scripts/verify-live-operating-contract.py --expected-sha <reviewed-full-sha>
 ```
 
 `<reviewed-full-sha>` must be the literal 40-hex SHA from the review handoff. Symbolic or caller-convenience values such as `HEAD`, `main`, or a tag are rejected. The gate records and verifies the HEAD SHA, clean status, launcher path/hash, clean-context launcher execution, source-update launcher publication, and behavioral suites. It fails when the checkout is dirty, the expected SHA differs, or an untracked file exists.

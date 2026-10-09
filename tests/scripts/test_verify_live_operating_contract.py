@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+import json
 import os
 import socket
+import sys
 from pathlib import Path
 
 
@@ -140,6 +142,37 @@ def test_account_home_ignores_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fake-hermes"))
     expected = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     assert verifier.account_home() == expected
+
+
+def test_behavioral_failure_never_reports_promotable(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    launcher = repo / ".hermes" / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher\n", encoding="utf-8")
+    sha = "a" * 40
+
+    monkeypatch.setattr(
+        verifier,
+        "git_text",
+        lambda _repo, *args: sha if args[:2] == ("rev-parse", "HEAD") else "",
+    )
+
+    def fake_run(command, *, cwd, env=None):
+        failed = command and str(command[0]).endswith("run_tests.sh")
+        return {"command": command, "returncode": 1 if failed else 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(verifier, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(SCRIPT), "--repo", str(repo), "--expected-sha", sha],
+    )
+
+    assert verifier.main() == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["failed"] == ["behavioral_contract"]
+    assert report["ok"] is False
+    assert report["promotable"] is False
 
 
 def test_live_command_env_overrides_caller_home_and_profile(monkeypatch, tmp_path):

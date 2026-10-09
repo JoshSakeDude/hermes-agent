@@ -24,6 +24,7 @@ EXPECTED_ROUTING = "origin_first"
 EXPECTED_STALE_SECONDS = "600"
 CONTRACT_TESTS = (
     "tests/hermes_cli/test_kanban_db.py",
+    "tests/hermes_cli/test_kanban_worker_attempt_log.py",
     "tests/hermes_cli/test_kanban_block_classify.py",
     "tests/gateway/test_kanban_origin_first_routing.py",
     "tests/gateway/test_wake_delivery.py",
@@ -264,6 +265,7 @@ def main() -> int:
         if not isinstance(value, dict) or value.get("returncode") != 0 or value.get("matches") is False
     ]
     report["ok"] = not failed
+    report["promotable"] = bool(report["promotable"]) and not failed
     report["failed"] = failed
     print(json.dumps(report, indent=2))
     return 0 if not failed else 1
