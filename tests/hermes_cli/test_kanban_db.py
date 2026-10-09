@@ -1699,6 +1699,98 @@ def test_resolve_hermes_argv_uses_installation_bootstrap_command(monkeypatch):
     assert roots == [Path(kbd.__file__).resolve().parents[1]]
 
 
+@pytest.mark.parametrize("profile", ["default", "gohanlite", "gohanreviewer"])
+@pytest.mark.parametrize("environment", ["service", "shell"])
+def test_default_spawn_profile_worktree_environment_matrix(
+    tmp_path, monkeypatch, profile, environment
+):
+    """Every production worker profile keeps the installation bootstrap.
+
+    Exercise the real ``_default_spawn`` argv/env builder from an unrelated task
+    worktree.  The service case has no shell startup help and a stripped PATH;
+    the shell case proves that an ambient PATH still cannot shadow discovery.
+    The resolved bootstrap must execute ``--version`` in the captured child env.
+    """
+    from hermes_cli import _launchers
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    if profile != "default":
+        profile_home = hermes_home / "profiles" / profile
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    workspace = tmp_path / "separate-task-worktree"
+    workspace.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    if environment == "service":
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.delenv("SHELL", raising=False)
+        monkeypatch.delenv("BASH_ENV", raising=False)
+    else:
+        monkeypatch.setenv("PATH", f"/tmp/planted:{os.environ.get('PATH', '')}")
+        monkeypatch.setenv("SHELL", "/bin/bash")
+
+    captured = {}
+    real_popen = subprocess.Popen
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            captured["cwd"] = kwargs["cwd"]
+            self.pid = 4242
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, command: command)
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda root: None)
+
+    task = kb.Task(
+        id=f"t_{profile}_{environment}", title="matrix", body=None,
+        assignee=profile, status="ready", priority=0, created_by=None,
+        created_at=0, started_at=None, completed_at=None,
+        workspace_kind="worktree", workspace_path=str(workspace),
+        claim_lock="claim", claim_expires=None, tenant=None,
+        branch_name="wt/matrix", current_run_id=1,
+    )
+    kbd._default_spawn(task, str(workspace))
+
+    repo_root = Path(kbd.__file__).resolve().parents[1]
+    launcher = _launchers.installation_command(repo_root)
+    assert captured["cmd"][:len(launcher)] == launcher
+    assert captured["cwd"] == str(workspace)
+    assert captured["env"]["HERMES_HOME"] == (
+        str(hermes_home) if profile == "default"
+        else str(hermes_home / "profiles" / profile)
+    )
+    monkeypatch.setattr(subprocess, "Popen", real_popen)
+    completed = subprocess.run(
+        [*launcher, "--version"], cwd=workspace, env=captured["env"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_repeated_identical_failures_replace_instead_of_concatenating(kanban_home):
+    """Retry accounting must not grow the stored diagnostic on each attempt."""
+    error = "hermes: no dependency environment is committed for this install"
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stable failure", assignee="default")
+        for _ in range(2):
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            assert not kbd._record_task_failure(
+                conn, tid, error=error, outcome="crashed", failure_limit=3,
+                expected_run_id=claimed.current_run_id,
+                release_claim=True, end_run=True,
+            )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        stored = task.last_failure_error
+    assert stored == error
+    assert stored.count(error) == 1
 
 
 def test_resolve_hermes_argv_module_actually_runs():

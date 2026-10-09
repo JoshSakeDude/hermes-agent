@@ -18,6 +18,7 @@ import time
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway import kanban_notify_routing as routing
 from gateway import kanban_watchers_notifier as notifier
 from gateway.kanban_notify_routing import ROUTE_ROLE_KEY
 from gateway.run import GatewayRunner
@@ -183,6 +184,37 @@ def _topic_rows(tid, role):
 
 def _sent_destinations(adapter):
     return [(s["chat_id"], s["metadata"].get("thread_id")) for s in adapter.sent]
+
+
+def test_handoff_event_remains_current_after_successor_claim(board):
+    """Review handoffs belong to the lifecycle, not only the emitting run.
+
+    The next lane normally claims the card within seconds.  That successor must
+    not make ``review_requested`` or ``changes_requested`` disappear from a
+    legacy wake subscription before it can be delivered.
+    """
+    conn = kbc.connect()
+    try:
+        for kind in ("review_requested", "changes_requested"):
+            tid = kb.create_task(conn, title=f"{kind} survives", assignee="gohanlite")
+            with kb.write_txn(conn):
+                old_run = conn.execute(
+                    "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', ?)",
+                    (tid, int(time.time())),
+                ).lastrowid
+                kb._append_event(conn, tid, kind, {"handoff": True}, run_id=old_run)
+                new_run = conn.execute(
+                    "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', ?)",
+                    (tid, int(time.time()) + 1),
+                ).lastrowid
+                conn.execute(
+                    "UPDATE tasks SET status='running', current_run_id=? WHERE id=?",
+                    (new_run, tid),
+                )
+            event = kb.list_events(conn, tid)[-1]
+            assert routing.event_is_current_attempt(conn, tid, event), kind
+    finally:
+        conn.close()
 
 
 def test_superseded_event_is_rechecked_before_wake(board, monkeypatch):

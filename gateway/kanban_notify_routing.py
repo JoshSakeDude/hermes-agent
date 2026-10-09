@@ -60,6 +60,9 @@ STALE_LOOKBACK_SECONDS = 2 * 86400
 # are filtered further by ``is_actionable``.
 ACTIONABLE_KINDS = ("completed", "blocked", "gave_up", "block_loop_detected", "status")
 _ACTIONABLE_STATUSES = {"blocked", "triage"}
+# Only failure telemetry is invalidated by a successor run. Lifecycle handoffs
+# such as review_requested/changes_requested must survive the next lane's claim.
+_ATTEMPT_SCOPED_KINDS = {"gave_up", "crashed", "timed_out"}
 
 
 def _kanban_cfg(cfg: Any) -> dict:
@@ -93,12 +96,15 @@ def is_actionable(ev: Any) -> bool:
 
 
 def event_is_current_attempt(conn: Any, task_id: str, ev: Any) -> bool:
-    """Return false when a run-scoped event has been superseded.
+    """Return false when attempt-scoped failure telemetry was superseded.
 
-    ``gave_up`` rows written by older releases may lack ``run_id``. Treat an
-    ambiguous equal/newer timestamp as stale rather than risking a false alert.
-    Other null-run events are task-scoped and remain eligible.
+    Review and other lifecycle handoffs remain eligible after the next lane
+    claims the card. ``gave_up`` rows written by older releases may lack
+    ``run_id``; treat an ambiguous equal/newer timestamp as stale rather than
+    risking a false alert. Other null-run events are task-scoped.
     """
+    if ev.kind not in _ATTEMPT_SCOPED_KINDS:
+        return True
     row = conn.execute(
         "SELECT id, started_at FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
         (task_id,),
